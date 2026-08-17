@@ -8,6 +8,8 @@ proved gone. Terminal states are immutable.
 from __future__ import annotations
 
 import os
+import hashlib
+import secrets
 import sqlite3
 import threading
 import uuid
@@ -22,6 +24,12 @@ MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+_MANAGED_EXECUTION_COLUMNS = {
+    "worker_started_at": "TEXT",
+    "lane_id": "TEXT",
+    "session_sha256": "TEXT",
+    "capability_sha256": "TEXT",
+}
 
 
 def _connect() -> sqlite3.Connection:
@@ -60,6 +68,12 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
     )
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(executions)").fetchall()
+    }
+    for column, declaration in _MANAGED_EXECUTION_COLUMNS.items():
+        if column not in columns:
+            conn.execute(f"ALTER TABLE executions ADD COLUMN {column} {declaration}")
 
 
 @contextmanager
@@ -154,6 +168,49 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     return record  # type: ignore[return-value]
 
 
+def create_managed_execution(
+    job_id: str, *, source: str, lane_id: str
+) -> tuple[Dict[str, Any], str]:
+    """Persist a managed attempt and return its process-local raw capability.
+
+    Only SHA-256 digests enter SQLite. The raw capability is returned once to
+    the scheduler dispatch closure and is never included in the record shape.
+    """
+    if not isinstance(lane_id, str) or not lane_id or len(lane_id) > 128:
+        raise ValueError("managed execution lane_id is invalid")
+    now = _hermes_now().isoformat()
+    execution_id = uuid.uuid4().hex
+    capability = secrets.token_urlsafe(32)
+    capability_sha256 = hashlib.sha256(capability.encode("utf-8")).hexdigest()
+    session_sha256 = hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+    pid = os.getpid()
+    with _transaction() as conn:
+        conn.execute(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, process_started_at,
+                status, claimed_at, lane_id, session_sha256, capability_sha256)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?)""",
+            (
+                execution_id,
+                str(job_id),
+                str(source),
+                _PROCESS_ID,
+                pid,
+                _process_start_time(pid),
+                now,
+                lane_id,
+                session_sha256,
+                capability_sha256,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone()
+    record = _record(row)
+    _emit_execution_state(record)
+    return record, capability  # type: ignore[return-value]
+
+
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     """Transition one claimed attempt to running exactly once."""
     now = _hermes_now().isoformat()
@@ -168,6 +225,28 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
         record = _record(conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
         ).fetchone())
+    _emit_execution_state(record)
+    return record
+
+
+def mark_managed_worker_started(execution_id: str) -> Optional[Dict[str, Any]]:
+    """Bind worker-start evidence to one already-running managed attempt."""
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET worker_started_at=?
+               WHERE id=? AND status='running' AND worker_started_at IS NULL
+                 AND lane_id IS NOT NULL AND session_sha256 IS NOT NULL
+                 AND capability_sha256 IS NOT NULL""",
+            (now, execution_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _record(
+            conn.execute(
+                "SELECT * FROM executions WHERE id=?", (execution_id,)
+            ).fetchone()
+        )
     _emit_execution_state(record)
     return record
 

@@ -289,12 +289,38 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    create_managed_execution,
+    finish_execution,
+    mark_execution_running,
+    mark_managed_worker_started,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+_MANAGED_EXECUTION_ID_ENV = "HERMES_MANAGED_EXECUTION_ID"
+_MANAGED_EXECUTION_CAPABILITY_ENV = "HERMES_MANAGED_EXECUTION_CAPABILITY"
+
+
+def _managed_execution_lane(job: dict) -> Optional[str]:
+    """Validate and return a job's scheduler-owned managed lane binding."""
+    context = job.get("managed_execution_context")
+    if context is None:
+        return None
+    if not isinstance(context, dict):
+        raise ValueError("managed_execution_context must be an object")
+    lane_id = context.get("lane_id")
+    expected = {
+        "lane_id": lane_id,
+        "execution_id_env": _MANAGED_EXECUTION_ID_ENV,
+        "execution_capability_env": _MANAGED_EXECUTION_CAPABILITY_ENV,
+    }
+    if context != expected or not isinstance(lane_id, str) or not lane_id:
+        raise ValueError("managed_execution_context is malformed")
+    return lane_id
 
 # Canonical silence tokens recognized in cron output.  Cron's contract is
 # intentionally looser than the gateway's exact-whole-response rule: the cron
@@ -4083,9 +4109,18 @@ def run_one_job(
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    execution_capability = job.get("_managed_execution_capability")
+    job = {key: value for key, value in job.items() if key != "_managed_execution_capability"}
+    managed_lane = _managed_execution_lane(job)
     execution_id = job.get("execution_id")
     if not execution_id:
-        execution_id = create_execution(job["id"], source="direct")["id"]
+        if managed_lane is None:
+            execution_id = create_execution(job["id"], source="direct")["id"]
+        else:
+            execution, execution_capability = create_managed_execution(
+                job["id"], source="direct", lane_id=managed_lane
+            )
+            execution_id = execution["id"]
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -4108,7 +4143,15 @@ def run_one_job(
 
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
-        mark_execution_running(execution_id)
+        running_execution = mark_execution_running(execution_id)
+        _managed_env_token = None
+        if managed_lane is not None:
+            if not isinstance(execution_capability, str) or not execution_capability:
+                raise RuntimeError("managed execution capability is missing at dispatch")
+            if running_execution is None:
+                raise RuntimeError("managed execution running transition was refused")
+            if mark_managed_worker_started(execution_id) is None:
+                raise RuntimeError("managed execution worker-start transition was refused")
 
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
@@ -4126,6 +4169,12 @@ def run_one_job(
         _scope_token = set_secret_scope(
             build_profile_secret_scope(_get_hermes_home())
         )
+        if managed_lane is not None:
+            from tools.environments.local import bind_managed_execution_env
+
+            _managed_env_token = bind_managed_execution_env(
+                execution_id, execution_capability
+            )
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
         # its finally block; doing that before _deliver_result runs means the
@@ -4150,6 +4199,10 @@ def run_one_job(
             raise
         finally:
             reset_secret_scope(_scope_token)
+            if _managed_env_token is not None:
+                from tools.environments.local import reset_managed_execution_env
+
+                reset_managed_execution_env(_managed_env_token)
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
@@ -4464,6 +4517,15 @@ def tick(
             membership is released in the worker's finally block.
             """
             job_id = job["id"]
+            try:
+                managed_lane = _managed_execution_lane(job)
+            except ValueError as exc:
+                logger.error(
+                    "Job '%s' not dispatched — invalid managed execution context: %s",
+                    job.get("name", job_id),
+                    exc,
+                )
+                return None
             # A tick can race gateway teardown: once the interpreter is
             # finalizing, ``pool.submit`` raises "cannot schedule new futures
             # after interpreter shutdown" and crashes the tick. Skip cleanly —
@@ -4480,8 +4542,16 @@ def tick(
                 return None
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
+            if managed_lane is None:
+                execution = create_execution(job_id, source="builtin")
+                execution_capability = None
+            else:
+                execution, execution_capability = create_managed_execution(
+                    job_id, source="builtin", lane_id=managed_lane
+                )
             dispatched_job = dict(job, execution_id=execution["id"])
+            if execution_capability is not None:
+                dispatched_job["_managed_execution_capability"] = execution_capability
             _ctx = contextvars.copy_context()
 
             def _run_and_release(j=dispatched_job, ctx=_ctx):

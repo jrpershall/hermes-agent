@@ -3,6 +3,7 @@
 import logging
 import ntpath
 import os
+from contextvars import ContextVar, Token
 import platform
 import re
 import shutil
@@ -20,6 +21,45 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 _IS_WINDOWS = platform.system() == "Windows"
 
 logger = logging.getLogger(__name__)
+
+_MANAGED_EXECUTION_ENV: ContextVar[tuple[str, str] | None] = ContextVar(
+    "hermes_managed_execution_env", default=None
+)
+_MANAGED_EXECUTION_ID_ENV = "HERMES_MANAGED_EXECUTION_ID"
+_MANAGED_EXECUTION_CAPABILITY_ENV = "HERMES_MANAGED_EXECUTION_CAPABILITY"
+
+
+def bind_managed_execution_env(
+    execution_id: str, capability: str
+) -> Token[tuple[str, str] | None]:
+    """Bind one scheduler-owned capability to the current worker context."""
+    if not execution_id or not capability:
+        raise ValueError("managed execution identity and capability are required")
+    return _MANAGED_EXECUTION_ENV.set((str(execution_id), str(capability)))
+
+
+def reset_managed_execution_env(token: Token[tuple[str, str] | None]) -> None:
+    _MANAGED_EXECUTION_ENV.reset(token)
+
+
+def _inject_managed_execution_env(env: dict[str, str]) -> None:
+    """Bridge the current worker capability without using process globals."""
+    binding = _MANAGED_EXECUTION_ENV.get()
+    if binding is None:
+        env.pop(_MANAGED_EXECUTION_ID_ENV, None)
+        env.pop(_MANAGED_EXECUTION_CAPABILITY_ENV, None)
+        return
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        if is_delegated_child_process_context():
+            env.pop(_MANAGED_EXECUTION_ID_ENV, None)
+            env.pop(_MANAGED_EXECUTION_CAPABILITY_ENV, None)
+            return
+    except Exception:
+        pass
+    env[_MANAGED_EXECUTION_ID_ENV] = binding[0]
+    env[_MANAGED_EXECUTION_CAPABILITY_ENV] = binding[1]
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -509,6 +549,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     _apply_windows_msys_bash_env_defaults(sanitized)
 
     sanitized = _scrub_delegated_child_kanban_env(sanitized)
+    _inject_managed_execution_env(sanitized)
 
     return sanitized
 
@@ -1324,6 +1365,7 @@ def _make_run_env(env: dict) -> dict:
     _apply_windows_msys_bash_env_defaults(run_env)
 
     run_env = _scrub_delegated_child_kanban_env(run_env)
+    _inject_managed_execution_env(run_env)
 
     return run_env
 
