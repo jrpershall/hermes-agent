@@ -3867,7 +3867,10 @@ def _drain_script_pipes(proc: subprocess.Popen) -> None:
     try:
         proc.communicate(timeout=5.0)
         return
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, UnicodeDecodeError):
+        # A worker can emit truncated/invalid UTF-8.  The main communicate()
+        # path reports that as a normal script failure; cleanup must not raise
+        # the same decode error again and escape the scheduler boundary.
         pass
     try:
         proc.kill()
