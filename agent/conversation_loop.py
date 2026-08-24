@@ -3002,6 +3002,13 @@ def run_conversation(
                     _xh["x-initiator"] = "user"
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
+
+                # Request middleware is plugin-owned and may export or retain
+                # both the effective and original request. Remove the raw
+                # managed capability before that first external boundary; the
+                # post-middleware pass below also strips anything echoed or
+                # reintroduced before provider and hook dispatch.
+                api_kwargs = agent._redact_managed_execution_content(api_kwargs)
                 try:
                     from hermes_cli.middleware import apply_llm_request_middleware
 

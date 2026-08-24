@@ -209,7 +209,7 @@ def test_managed_capability_is_redacted_from_provider_and_hook_payloads(
 def test_managed_capability_never_reaches_provider_or_pre_api_hook(
     agent, monkeypatch
 ):
-    from hermes_cli import lifecycle, observability, plugins
+    from hermes_cli import lifecycle, middleware, observability, plugins
     from tools.environments import local
 
     execution_id = "managed-execution-id-provider-boundary"
@@ -223,12 +223,26 @@ def test_managed_capability_never_reaches_provider_or_pre_api_hook(
     )
     provider_requests = []
     hook_calls = []
+    middleware_requests = []
     agent._interruptible_api_call = (
         lambda kwargs: provider_requests.append(kwargs)
         or _mock_response(content="completed")
     )
     agent._persist_session = lambda *args, **kwargs: None
     agent._save_trajectory = lambda *args, **kwargs: None
+    monkeypatch.setattr(
+        middleware,
+        "apply_llm_request_middleware",
+        lambda request, **_context: (
+            middleware_requests.append(request)
+            or middleware.RequestMiddlewareResult(
+                payload=request,
+                original_payload=request,
+                changed=False,
+                trace=[],
+            )
+        ),
+    )
     monkeypatch.setattr(lifecycle, "has_hook", lambda name: name == "pre_api_request")
     monkeypatch.setattr(observability, "observe_lifecycle", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -246,7 +260,7 @@ def test_managed_capability_never_reaches_provider_or_pre_api_hook(
     assert result["completed"] is True
     assert provider_requests
     assert hook_calls
-    for payload in (provider_requests, hook_calls):
+    for payload in (middleware_requests, provider_requests, hook_calls):
         encoded = json.dumps(payload, default=str)
         assert execution_id in encoded
         assert capability not in encoded
