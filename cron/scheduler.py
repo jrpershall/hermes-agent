@@ -39,7 +39,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional, Protocol
+from typing import Any, Callable, List, Optional, Protocol
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -3963,10 +3963,36 @@ def _resolve_job_script_path(script_path: str) -> tuple[Optional[Path], Optional
     return path, None
 
 
+_MANAGED_SCRIPT_BOOTSTRAP = (
+    "import json, os, subprocess, sys;"
+    "line=sys.stdin.buffer.readline();"
+    "sys.exit(125) if not line else None;"
+    "bindings=json.loads(line.decode('utf-8'));"
+    "env=os.environ.copy(); env.update(bindings);"
+    "argv=json.loads(sys.argv[1]);"
+    "sys.exit(subprocess.run(argv, env=env, stdin=subprocess.DEVNULL).returncode)"
+)
+
+
+def _managed_script_bootstrap_argv(argv: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Build a portable child barrier that receives its principal over stdin.
+
+    The bootstrap contains no capability. It blocks before the actual script is
+    launched; only after the parent durably binds the execution row does it send
+    the environment payload and release the script. A closed pipe means fail
+    closed with exit 125.
+    """
+    python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
+    return [python_exe, "-c", _MANAGED_SCRIPT_BOOTSTRAP, json.dumps(argv)], env_overlay
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    managed_worker_bind: Optional[
+        Callable[[], tuple[Optional[dict[str, str]], Optional[str]]]
+    ] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4055,6 +4081,9 @@ def _run_job_script(
             }
         env = build_subprocess_env()
         env.update(env_overlay)
+        if managed_worker_bind is not None:
+            argv, bootstrap_overlay = _managed_script_bootstrap_argv(argv)
+            env.update(bootstrap_overlay)
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
@@ -4062,6 +4091,7 @@ def _run_job_script(
         _script_cwd = workdir or str(path.parent)
         proc = subprocess.Popen(
             argv,
+            stdin=subprocess.PIPE if managed_worker_bind is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -4069,6 +4099,46 @@ def _run_job_script(
             env=env,
             **popen_kwargs,
         )
+        managed_values: tuple[str, ...] = ()
+        if managed_worker_bind is not None:
+            if cancel_event is not None and cancel_event.is_set():
+                if proc.stdin is not None:
+                    proc.stdin.close()
+                    proc.stdin = None
+                _terminate_cron_script_process(proc)
+                _drain_script_pipes(proc)
+                return False, "Script cancelled before managed worker binding"
+            try:
+                bindings, binding_error = managed_worker_bind()
+            except Exception as exc:
+                bindings, binding_error = None, (
+                    f"Managed worker binding failed: {type(exc).__name__}"
+                )
+                logger.error(
+                    "Managed no_agent binding callback failed (%s)",
+                    type(exc).__name__,
+                    exc_info=True,
+                )
+            if bindings is None:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+                    proc.stdin = None
+                _drain_script_pipes(proc)
+                return False, binding_error or "Managed worker binding was refused"
+            managed_values = tuple(bindings.values())
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(json.dumps(bindings) + "\n")
+                proc.stdin.flush()
+                proc.stdin.close()
+                proc.stdin = None
+            except Exception as exc:
+                _terminate_cron_script_process(proc)
+                _drain_script_pipes(proc)
+                return False, (
+                    "Managed worker bootstrap release failed: "
+                    f"{type(exc).__name__}"
+                )
         deadline = time.monotonic() + script_timeout
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -4095,8 +4165,12 @@ def _run_job_script(
             from agent.redact import redact_sensitive_text
             from tools.environments.local import redact_managed_execution_values
 
-            stdout = redact_managed_execution_values(redact_sensitive_text(stdout))
-            stderr = redact_managed_execution_values(redact_sensitive_text(stderr))
+            stdout = redact_managed_execution_values(
+                redact_sensitive_text(stdout), extra_values=managed_values
+            )
+            stderr = redact_managed_execution_values(
+                redact_sensitive_text(stderr), extra_values=managed_values
+            )
         except Exception as e:
             logger.warning("Failed to redact sensitive text from output: %s", e)
             stdout = "[REDACTED - redaction failed]"
@@ -4121,6 +4195,9 @@ def _run_job_script_with_claim_heartbeat(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    managed_worker_bind: Optional[
+        Callable[[], tuple[Optional[dict[str, str]], Optional[str]]]
+    ] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -4142,7 +4219,12 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            managed_worker_bind=managed_worker_bind,
+        )
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -4173,10 +4255,20 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            managed_worker_bind=managed_worker_bind,
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            managed_worker_bind=managed_worker_bind,
+        )
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -5198,35 +5290,12 @@ def run_job(
             )
             _job_workdir = None
 
-        # For a no_agent job the script is not a preflight gate: it is the
-        # worker itself. A managed no_agent worker therefore needs the same
-        # scheduler-owned principal before its process starts. Agent-backed
-        # jobs remain different: their script runs above the managed bind as a
-        # wake gate and never sees the principal.
+        # For a no_agent job the script is the worker. For managed jobs the
+        # scheduler spawns a credential-free bootstrap blocked on stdin, binds
+        # this exact execution row once Popen succeeds, then sends the principal
+        # over the private pipe to release the actual script.
+        _managed_worker_bind = None
         if _managed_context is not None:
-            # Binding means a worker is authorized to start. Complete every
-            # deterministic script precondition first so a missing/blocked
-            # path cannot create phantom durable worker evidence.
-            _resolved_script, _script_preflight_error = _resolve_job_script_path(
-                script_path
-            )
-            if _script_preflight_error is not None or _resolved_script is None:
-                _preflight_output = _script_preflight_error or (
-                    "Blocked: script path could not be resolved"
-                )
-                _preflight_now = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
-                _preflight_alert = (
-                    f"⚠ Cron watchdog '{job_name}' script failed\n\n"
-                    f"{_preflight_output}\n\nTime: {_preflight_now}"
-                )
-                _preflight_doc = (
-                    f"# Cron Job: {job_name}\n\n"
-                    f"**Job ID:** {job_id}\n"
-                    f"**Run Time:** {_preflight_now}\n"
-                    f"**Mode:** no_agent (script)\n"
-                    f"**Status:** script failed\n\n{_preflight_output}\n"
-                )
-                return False, _preflight_doc, _preflight_alert, _preflight_output
             _managed_execution_id = job.get("execution_id")
             if not isinstance(_managed_execution_id, str) or not _managed_execution_id:
                 return _refuse_managed_dispatch(
@@ -5242,64 +5311,65 @@ def run_job(
             _managed_session_sha256 = hashlib.sha256(
                 f"{_managed_execution_id}:{_no_agent_session_id}".encode("utf-8")
             ).hexdigest()
-            try:
-                _managed_bound = bind_managed_worker(
-                    _managed_execution_id,
-                    job_id=job_id,
-                    lane_id=_managed_context["lane_id"],
-                    session_sha256=_managed_session_sha256,
-                    capability_sha256=capability_digest(_managed_capability),
-                )
-            except Exception as exc:
-                logger.error(
-                    "Job '%s': managed no_agent binding write failed (%s)",
-                    job_id,
-                    type(exc).__name__,
-                    exc_info=True,
-                )
-                _managed_bound = None
-            if _managed_bound is None:
-                return _refuse_managed_dispatch(
-                    job_id,
-                    job_name,
-                    f"managed execution {_managed_execution_id} could not be durably "
-                    f"bound to lane {_managed_context['lane_id']!r} (row missing, not "
-                    "running, already bound, or ledger write failed); script worker NOT run",
-                )
-            from tools.environments.local import bind_managed_execution_env
+            _bind_attempted = False
 
-            _managed_env_token = bind_managed_execution_env(
-                {
+            def _bind_no_agent_worker():
+                nonlocal _bind_attempted
+                if _bind_attempted:
+                    return None, "managed worker binding was attempted more than once"
+                _bind_attempted = True
+                try:
+                    bound = bind_managed_worker(
+                        _managed_execution_id,
+                        job_id=job_id,
+                        lane_id=_managed_context["lane_id"],
+                        session_sha256=_managed_session_sha256,
+                        capability_sha256=capability_digest(_managed_capability),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Job '%s': managed no_agent binding write failed (%s)",
+                        job_id,
+                        type(exc).__name__,
+                        exc_info=True,
+                    )
+                    bound = None
+                if bound is None:
+                    return None, (
+                        f"managed execution {_managed_execution_id} could not be durably "
+                        f"bound to lane {_managed_context['lane_id']!r} (row missing, not "
+                        "running, already bound, or ledger write failed); script worker NOT run"
+                    )
+                logger.info(
+                    "Job '%s': managed no_agent worker bound to execution %s on lane %s",
+                    job_id,
+                    _managed_execution_id,
+                    _managed_context["lane_id"],
+                )
+                return {
                     _managed_context["execution_id_env"]: _managed_execution_id,
                     _managed_context["execution_capability_env"]: _managed_capability,
-                }
-            )
-            del _managed_capability
-            logger.info(
-                "Job '%s': managed no_agent worker bound to execution %s on lane %s",
-                job_id,
-                _managed_execution_id,
-                _managed_context["lane_id"],
-            )
+                }, None
+
+            _managed_worker_bind = _bind_no_agent_worker
 
         try:
-            try:
-                ok, output = _run_job_script_with_claim_heartbeat(
-                    job, script_path, workdir=_job_workdir, cancel_event=cancel_event,
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Job '%s': script execution raised unexpectedly", job_id,
-                )
-                ok, output = False, f"Script execution failed: {exc}"
-        finally:
-            # The principal belongs only to the script worker. Delivery and
-            # no_agent result formatting happen after it has been removed.
-            if _managed_env_token is not None:
-                from tools.environments.local import reset_managed_execution_env
-
-                reset_managed_execution_env(_managed_env_token)
-                _managed_env_token = None
+            _script_runner_kwargs = {
+                "workdir": _job_workdir,
+                "cancel_event": cancel_event,
+            }
+            if _managed_worker_bind is not None:
+                _script_runner_kwargs["managed_worker_bind"] = _managed_worker_bind
+            ok, output = _run_job_script_with_claim_heartbeat(
+                job,
+                script_path,
+                **_script_runner_kwargs,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Job '%s': script execution raised unexpectedly", job_id,
+            )
+            ok, output = False, f"Script execution failed: {exc}"
 
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 

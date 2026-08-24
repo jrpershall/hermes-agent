@@ -78,15 +78,17 @@ def reset_managed_execution_env(token: Token[tuple[tuple[str, str], ...] | None]
     _MANAGED_EXECUTION_ENV.reset(token)
 
 
-def redact_managed_execution_values(text: str) -> str:
+def redact_managed_execution_values(
+    text: str, *, extra_values: "Iterable[str]" = ()
+) -> str:
     """Remove bound principal values before worker output crosses its boundary."""
     redacted = str(text)
     binding = _MANAGED_EXECUTION_ENV.get()
-    if binding is None:
-        return redacted
+    values = [value for _name, value in binding] if binding is not None else []
+    values.extend(str(value) for value in extra_values)
     # Longest first avoids leaving a longer secret partially exposed when one
     # configured value happens to contain another.
-    for _name, value in sorted(binding, key=lambda item: len(item[1]), reverse=True):
+    for value in sorted(values, key=len, reverse=True):
         if value:
             redacted = redacted.replace(value, "[REDACTED_MANAGED_EXECUTION_PRINCIPAL]")
     return redacted

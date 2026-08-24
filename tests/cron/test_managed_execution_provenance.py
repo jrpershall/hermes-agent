@@ -309,12 +309,21 @@ def test_managed_no_agent_script_is_bound_as_the_worker(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     job = _managed_job(_write_no_agent_worker(home), no_agent=True)
+    real_bind = scheduler.bind_managed_worker
+    bind_calls: list[str] = []
+
+    def _counting_bind(execution_id, **kwargs):
+        bind_calls.append(execution_id)
+        return real_bind(execution_id, **kwargs)
+
+    monkeypatch.setattr(scheduler, "bind_managed_worker", _counting_bind)
 
     assert scheduler.run_one_job(job) is True
 
     rows = executions.list_executions(job_id="managed-job")
     assert len(rows) == 1
     row = rows[0]
+    assert bind_calls == [row["id"]]
     assert row["status"] == "completed"
     assert row["lane_id"] == "repair-3"
     assert row["worker_started_at"]
@@ -332,14 +341,53 @@ def test_managed_no_agent_script_is_bound_as_the_worker(
     assert CAP_ENV not in local.hermes_subprocess_env()
 
 
+def test_managed_no_agent_scheduler_execution_row_is_bound(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _managed_job(_write_no_agent_worker(home), no_agent=True)
+    scheduled = executions.create_execution(job["id"], source="builtin")
+    job["execution_id"] = scheduled["id"]
+
+    assert scheduler.run_one_job(job) is True
+
+    (row,) = executions.list_executions(job_id=job["id"])
+    assert row["id"] == scheduled["id"]
+    assert row["source"] == "builtin"
+    assert row["status"] == "completed"
+    assert row["lane_id"] == CONTEXT["lane_id"]
+    observed = json.loads((home / "no-agent-worker-env.json").read_text())
+    assert observed[ID_ENV] == scheduled["id"]
+    assert executions.capability_digest(observed[CAP_ENV]) == row["capability_sha256"]
+
+
 def test_managed_no_agent_binding_refusal_never_starts_script(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     job = _managed_job(_write_no_agent_worker(home), no_agent=True)
-    monkeypatch.setattr(scheduler, "bind_managed_worker", lambda *a, **k: None)
+    real_popen = scheduler.subprocess.Popen
+    spawned: list[subprocess.Popen] = []
+    bind_saw_spawn: list[bool] = []
+
+    def _tracking_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    def _refuse_bind(*_args, **_kwargs):
+        bind_saw_spawn.append(bool(spawned))
+        return None
+
+    monkeypatch.setattr(scheduler.subprocess, "Popen", _tracking_popen)
+    monkeypatch.setattr(scheduler, "bind_managed_worker", _refuse_bind)
 
     assert scheduler.run_one_job(job) is True
 
+    # The scheduler may create a blocked child first, but durable refusal must
+    # happen after successful Popen and must release that child without ever
+    # entering the actual script.
+    assert bind_saw_spawn == [True]
+    assert len(spawned) == 1
+    assert spawned[0].poll() is not None
     assert not (home / "no-agent-worker-env.json").exists()
     row = executions.list_executions(job_id="managed-job")[0]
     assert row["status"] == "failed"
@@ -348,21 +396,109 @@ def test_managed_no_agent_binding_refusal_never_starts_script(
     assert "could not be durably bound" in (row["error"] or "")
 
 
+def test_managed_no_agent_popen_failure_creates_no_worker_evidence(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _managed_job(_write_no_agent_worker(home), no_agent=True)
+
+    def _popen_failure(*_args, **_kwargs):
+        raise OSError("synthetic Popen failure")
+
+    monkeypatch.setattr(scheduler.subprocess, "Popen", _popen_failure)
+
+    assert scheduler.run_one_job(job) is True
+
+    assert not (home / "no-agent-worker-env.json").exists()
+    row = executions.list_executions(job_id="managed-job")[0]
+    assert row["status"] == "failed"
+    assert all(row[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS)
+    assert "Popen failure" in (row["error"] or "")
+
+
+def test_managed_no_agent_spawn_preparation_failure_creates_no_worker_evidence(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _managed_job(_write_no_agent_worker(home), no_agent=True)
+
+    from tools.environments import local as local_environment
+
+    def _env_failure(*_args, **_kwargs):
+        raise OSError("synthetic environment failure")
+
+    monkeypatch.setattr(local_environment, "build_subprocess_env", _env_failure)
+
+    assert scheduler.run_one_job(job) is True
+
+    row = executions.list_executions(job_id="managed-job")[0]
+    assert row["status"] == "failed"
+    assert all(row[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS)
+    assert "environment failure" in (row["error"] or "")
+
+
+def test_managed_no_agent_dispatch_lock_failure_creates_no_worker_evidence(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _managed_job(_write_no_agent_worker(home), no_agent=True)
+
+    def _lock_failure(*_args, **_kwargs):
+        raise OSError("synthetic jobs lock failure")
+
+    monkeypatch.setattr(scheduler, "claim_dispatch", _lock_failure)
+
+    assert scheduler.run_one_job(job) is False
+
+    assert not (home / "no-agent-worker-env.json").exists()
+    (row,) = executions.list_executions(job_id=job["id"])
+    assert row["status"] == "failed"
+    assert all(row[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS)
+    assert "jobs lock failure" in (row["error"] or "")
+
+
+def test_managed_no_agent_missing_interpreter_creates_no_worker_evidence(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = home / "scripts" / "worker.sh"
+    script.write_text("printf 'worker completed\\n'\n", encoding="utf-8")
+    job = _managed_job(script.name, no_agent=True)
+    monkeypatch.setattr(scheduler.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(scheduler.os.path, "isfile", lambda _path: False)
+
+    assert scheduler.run_one_job(job) is True
+
+    row = executions.list_executions(job_id="managed-job")[0]
+    assert row["status"] == "failed"
+    assert all(row[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS)
+    assert "bash not found" in (row["error"] or "")
+
+
 def test_managed_no_agent_output_cannot_persist_or_deliver_raw_capability(
-    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
 ) -> None:
     raw = "managed-capability-must-never-leave-worker"
     monkeypatch.setattr(scheduler.secrets, "token_urlsafe", lambda _n: raw)
+    real_popen = scheduler.subprocess.Popen
+    launch_material: list[str] = []
+
+    def _capture_launch(*args, **kwargs):
+        launch_material.append(repr((args, kwargs)))
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler.subprocess, "Popen", _capture_launch)
     stubs = _RunJobStubs(monkeypatch, tmp_path)
     job = _managed_job(_write_no_agent_leaky_worker(home), no_agent=True)
 
-    assert scheduler.run_one_job(job) is True
+    with caplog.at_level("DEBUG"):
+        assert scheduler.run_one_job(job) is True
 
     row = executions.list_executions(job_id="managed-job")[0]
     assert row["capability_sha256"] == hashlib.sha256(raw.encode()).hexdigest()
     assert stubs.observed["docs"]
     assert raw not in "\n".join(stubs.observed["docs"])
     assert not any(raw in str(run) for run in stubs.observed.get("runs", []))
+    assert raw not in "\n".join(launch_material)
+    assert raw not in caplog.text
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as db:
+        assert raw not in "\n".join(db.iterdump())
 
 
 def test_managed_no_agent_missing_script_creates_no_worker_evidence(
