@@ -545,6 +545,161 @@ def test_managed_no_agent_delayed_ack_read_preserves_worker_output(
     assert "worker completed" in "\n".join(stubs.observed.get("docs", []))
 
 
+def test_managed_no_agent_success_reaps_devnull_descendant(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Terminal success must end every raw-capability process in the worker tree."""
+    pid_file = home / "descendant.pid"
+    script = home / "scripts" / "no_agent_descendant_worker.py"
+    script.write_text(
+        "import subprocess, sys\n"
+        "child = subprocess.Popen(\n"
+        "    [sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+        "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
+        "    stderr=subprocess.DEVNULL,\n"
+        ")\n"
+        f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+        "print('worker completed')\n",
+        encoding="utf-8",
+    )
+    job = _managed_job(script.name, no_agent=True)
+    real_ack = scheduler.acknowledge_managed_worker_started
+    ack_calls: list[str] = []
+
+    def _counting_ack(execution_id, **kwargs):
+        ack_calls.append(execution_id)
+        return real_ack(execution_id, **kwargs)
+
+    monkeypatch.setattr(scheduler, "acknowledge_managed_worker_started", _counting_ack)
+
+    started = time.monotonic()
+    assert scheduler.run_one_job(job) is True
+    assert time.monotonic() - started < 3
+    descendant_pid = int(pid_file.read_text())
+
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(descendant_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail(f"managed descendant {descendant_pid} survived terminal success")
+    finally:
+        # Keep the predecessor RED hermetic instead of leaking its reproducer.
+        subprocess.run(["kill", "-9", str(descendant_pid)], check=False)
+
+    (row,) = executions.list_executions(job_id=job["id"])
+    assert ack_calls == [row["id"]]
+    assert row["worker_started_at"]
+    assert row["lane_id"] == CONTEXT["lane_id"]
+    assert SHA256_RE.match(row["session_sha256"])
+    assert SHA256_RE.match(row["capability_sha256"])
+
+
+def test_managed_no_agent_ack_follows_worker_spawn_but_precedes_script_side_effect(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The durable ACK fences a real blocked worker, not bootstrap readiness."""
+    worker_ready = home / "worker-gate-ready"
+    script_side_effect = home / "script-side-effect"
+    script = home / "scripts" / "no_agent_ack_order.py"
+    script.write_text(
+        f"open({str(script_side_effect)!r}, 'w').write('ran')\n",
+        encoding="utf-8",
+    )
+    gate = (
+        "import json, os, sys\n"
+        "argv = json.loads(sys.argv[1])\n"
+        f"open({str(worker_ready)!r}, 'w').write(str(os.getpid()))\n"
+        f"print({scheduler._MANAGED_SCRIPT_BOOTSTRAP_ACK!r}, flush=True)\n"
+        "release = sys.stdin.buffer.readline()\n"
+        f"if release.decode().strip() != {scheduler._MANAGED_SCRIPT_BOOTSTRAP_RELEASE!r}:\n"
+        "    sys.exit(126)\n"
+        "os.execvpe(argv[0], argv, os.environ)\n"
+    )
+    monkeypatch.setattr(scheduler, "_MANAGED_SCRIPT_WORKER_GATE", gate)
+    real_ack = scheduler.acknowledge_managed_worker_started
+    observations: list[tuple[bool, bool]] = []
+
+    def _observing_ack(execution_id, **kwargs):
+        observations.append((worker_ready.exists(), script_side_effect.exists()))
+        return real_ack(execution_id, **kwargs)
+
+    monkeypatch.setattr(scheduler, "acknowledge_managed_worker_started", _observing_ack)
+
+    assert scheduler.run_one_job(_managed_job(script.name, no_agent=True)) is True
+
+    assert observations == [(True, False)]
+    assert script_side_effect.read_text() == "ran"
+
+
+def test_managed_no_agent_premature_direct_worker_exit_clears_reservation(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = home / "script-side-effect"
+    script = home / "scripts" / "no_agent_unreleased.py"
+    script.write_text(f"open({str(marker)!r}, 'w').write('ran')\n", encoding="utf-8")
+    monkeypatch.setattr(
+        scheduler,
+        "_MANAGED_SCRIPT_WORKER_GATE",
+        "import sys; sys.exit(124)",
+    )
+
+    assert scheduler.run_one_job(_managed_job(script.name, no_agent=True)) is True
+
+    assert not marker.exists()
+    (row,) = executions.list_executions(job_id="managed-job")
+    assert row["status"] == "failed"
+    assert all(row[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS)
+
+
+def test_managed_no_agent_execute_release_broken_pipe_clears_worker_evidence(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed execute release cannot leave a durable claim that the script ran."""
+    marker = home / "script-side-effect"
+    script = home / "scripts" / "no_agent_release_probe.py"
+    script.write_text(
+        f"open({str(marker)!r}, 'w').write('ran')\n",
+        encoding="utf-8",
+    )
+    job = _managed_job(script.name, no_agent=True)
+    real_popen = scheduler.subprocess.Popen
+
+    class _BreakExecuteRelease:
+        def __init__(self, stream):
+            self._stream = stream
+            self._writes = 0
+
+        def write(self, data):
+            self._writes += 1
+            if self._writes == 2:
+                raise BrokenPipeError("synthetic execute-release failure")
+            return self._stream.write(data)
+
+        def __getattr__(self, name):
+            return getattr(self._stream, name)
+
+    def _break_second_stdin_write(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        if kwargs.get("stdin") == subprocess.PIPE:
+            proc.stdin = _BreakExecuteRelease(proc.stdin)  # type: ignore[assignment]
+        return proc
+
+    monkeypatch.setattr(scheduler.subprocess, "Popen", _break_second_stdin_write)
+
+    assert scheduler.run_one_job(job) is True
+
+    assert not marker.exists()
+    (row,) = executions.list_executions(job_id=job["id"])
+    assert row["status"] == "failed"
+    assert all(row[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS)
+    assert "release failed" in (row["error"] or "").lower()
+
+
 def test_managed_no_agent_scheduler_execution_row_is_bound(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1305,6 +1460,42 @@ def test_clear_preparation_requires_exact_unacknowledged_tuple(home: Path) -> No
 
     assert executions.clear_managed_worker_preparation(row["id"], **common) is True
     persisted = executions.latest_execution("clear-job")
+    assert persisted["status"] == "running"
+    assert all(
+        persisted[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS
+    )
+
+
+def test_clear_started_worker_requires_exact_acknowledged_tuple(home: Path) -> None:
+    digest = "4" * 64
+    other_digest = "5" * 64
+    common = dict(
+        job_id="release-job",
+        lane_id="repair-3",
+        session_sha256=digest,
+        capability_sha256=digest,
+    )
+    row = executions.create_execution("release-job", source="builtin")
+    assert executions.mark_execution_running(row["id"])
+    assert executions.prepare_managed_worker(row["id"], **common)
+    assert executions.acknowledge_managed_worker_started(row["id"], **common)
+
+    for mismatch in (
+        {"job_id": "other"},
+        {"lane_id": "repair-4"},
+        {"session_sha256": other_digest},
+        {"capability_sha256": other_digest},
+    ):
+        assert (
+            executions.clear_managed_worker_start(
+                row["id"], **{**common, **mismatch}
+            )
+            is False
+        )
+
+    assert executions.clear_managed_worker_start(row["id"], **common) is True
+    persisted = executions.latest_execution("release-job")
+    assert persisted is not None
     assert persisted["status"] == "running"
     assert all(
         persisted[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS

@@ -383,6 +383,34 @@ def clear_managed_worker_preparation(
         return cur.rowcount == 1
 
 
+def clear_managed_worker_start(
+    execution_id: str,
+    *,
+    job_id: str,
+    lane_id: str,
+    session_sha256: str,
+    capability_sha256: str,
+) -> bool:
+    """Roll back one exact start whose final execute release could not be sent."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions
+               SET worker_started_at=NULL, lane_id=NULL,
+                   session_sha256=NULL, capability_sha256=NULL
+               WHERE id=? AND job_id=? AND status='running'
+                 AND worker_started_at IS NOT NULL AND lane_id=?
+                 AND session_sha256=? AND capability_sha256=?""",
+            (
+                execution_id,
+                str(job_id),
+                lane_id,
+                session_sha256,
+                capability_sha256,
+            ),
+        )
+    return cur.rowcount == 1
+
+
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,

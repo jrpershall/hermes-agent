@@ -553,6 +553,7 @@ from cron.executions import (
     bind_managed_worker,
     capability_digest,
     clear_managed_worker_preparation,
+    clear_managed_worker_start,
     create_execution,
     finish_execution,
     mark_execution_running,
@@ -3808,9 +3809,9 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
 
 def _terminate_cron_script_process(proc: subprocess.Popen) -> None:
     """Best-effort hard stop of a cron script and every child it spawned."""
-    if proc.poll() is not None:
-        return
     if sys.platform == "win32":
+        if proc.poll() is not None:
+            return
         try:
             subprocess.run(
                 ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
@@ -3822,10 +3823,10 @@ def _terminate_cron_script_process(proc: subprocess.Popen) -> None:
         except (OSError, subprocess.TimeoutExpired):
             proc.kill()
     else:
-        try:
-            process_group: Optional[int] = os.getpgid(proc.pid)
-        except (ProcessLookupError, OSError):
-            process_group = None
+        # Every cron script is a session leader. Its PID remains the process
+        # group ID after the leader exits, so do not return merely because
+        # communicate() reaped it: successful workers may leave descendants.
+        process_group: Optional[int] = proc.pid
         if process_group is not None:
             try:
                 os.killpg(process_group, signal.SIGTERM)  # windows-footgun: ok — POSIX-only branch (win32 handled above)
@@ -3849,11 +3850,12 @@ def _terminate_cron_script_process(proc: subprocess.Popen) -> None:
                         os.killpg(process_group, getattr(signal, "SIGKILL", signal.SIGTERM))
                     except (ProcessLookupError, PermissionError, OSError):
                         pass
-    try:
-        proc.wait(timeout=1.0)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=1.0)
+    if proc.poll() is None:
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=1.0)
 
 
 def _drain_script_pipes(proc: subprocess.Popen) -> None:
@@ -3971,7 +3973,16 @@ def _resolve_job_script_path(script_path: str) -> tuple[Optional[Path], Optional
 
 _MANAGED_SCRIPT_BOOTSTRAP_ACK = "HERMES_MANAGED_SCRIPT_WORKER_STARTED_V1"
 _MANAGED_SCRIPT_BOOTSTRAP_RELEASE = "HERMES_MANAGED_SCRIPT_EXECUTE_V1"
-_MANAGED_SCRIPT_BOOTSTRAP = """\
+_MANAGED_SCRIPT_WORKER_GATE = """\
+import json, os, sys
+argv = json.loads(sys.argv[1])
+print("HERMES_MANAGED_SCRIPT_WORKER_STARTED_V1", flush=True)
+release = sys.stdin.buffer.readline()
+if release.decode("utf-8", errors="replace").strip() != "HERMES_MANAGED_SCRIPT_EXECUTE_V1":
+    sys.exit(126)
+os.execvpe(argv[0], argv, os.environ)
+"""
+_MANAGED_SCRIPT_BOOTSTRAP = f"""\
 import json, os, subprocess, sys
 line = sys.stdin.buffer.readline()
 if not line:
@@ -3980,17 +3991,29 @@ bindings = json.loads(line.decode("utf-8"))
 env = os.environ.copy()
 env.update(bindings)
 argv = json.loads(sys.argv[1])
-print("HERMES_MANAGED_SCRIPT_WORKER_STARTED_V1", flush=True)
-release = sys.stdin.buffer.readline()
-if release.decode("utf-8", errors="replace").strip() != "HERMES_MANAGED_SCRIPT_EXECUTE_V1":
-    sys.exit(126)
+worker_gate = sys.argv[2]
 worker = subprocess.Popen(
-    argv,
+    [sys.executable, "-c", worker_gate, json.dumps(argv)],
     env=env,
-    stdin=subprocess.DEVNULL,
+    stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
 )
+ack = worker.stdout.readline()
+if not ack:
+    worker.wait()
+    sys.exit(worker.returncode or 124)
+sys.stdout.buffer.write(ack)
+sys.stdout.buffer.flush()
+release = sys.stdin.buffer.readline()
+if release.decode("utf-8", errors="replace").strip() != "HERMES_MANAGED_SCRIPT_EXECUTE_V1":
+    worker.kill()
+    worker.wait()
+    sys.exit(126)
+worker.stdin.write(release)
+worker.stdin.flush()
+worker.stdin.close()
+worker.stdin = None
 stdout, stderr = worker.communicate()
 sys.stdout.buffer.write(stdout or b"")
 sys.stderr.buffer.write(stderr or b"")
@@ -4007,7 +4030,13 @@ def _managed_script_bootstrap_argv(argv: list[str]) -> tuple[list[str], dict[str
     closed with exit 125.
     """
     python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
-    return [python_exe, "-c", _MANAGED_SCRIPT_BOOTSTRAP, json.dumps(argv)], env_overlay
+    return [
+        python_exe,
+        "-c",
+        _MANAGED_SCRIPT_BOOTSTRAP,
+        json.dumps(argv),
+        _MANAGED_SCRIPT_WORKER_GATE,
+    ], env_overlay
 
 
 def _read_managed_script_bootstrap_ack(
@@ -4069,6 +4098,7 @@ def _run_job_script(
         Callable[[], tuple[bool, Optional[str]]]
     ] = None,
     managed_worker_abort: Optional[Callable[[], None]] = None,
+    managed_worker_release_abort: Optional[Callable[[], None]] = None,
     managed_capability_env_name: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
@@ -4261,6 +4291,8 @@ def _run_job_script(
                 proc.stdin.close()
                 proc.stdin = None
             except Exception as exc:
+                if managed_worker_release_abort is not None:
+                    managed_worker_release_abort()
                 _terminate_cron_script_process(proc)
                 _drain_script_pipes(proc)
                 return False, (
@@ -4286,6 +4318,12 @@ def _run_job_script(
 
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()
+
+        if managed_worker_bind is not None:
+            # A terminal managed execution owns the whole session, not only
+            # its direct worker. Reap DEVNULL/pipe-detached descendants even
+            # after the bootstrap itself exited successfully.
+            _terminate_cron_script_process(proc)
 
         # Redact ordinary secrets and the exact managed principal before any
         # return path can persist or deliver worker-controlled output.
@@ -4367,6 +4405,7 @@ def _run_job_script_with_claim_heartbeat(
         Callable[[], tuple[bool, Optional[str]]]
     ] = None,
     managed_worker_abort: Optional[Callable[[], None]] = None,
+    managed_worker_release_abort: Optional[Callable[[], None]] = None,
     managed_capability_env_name: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
@@ -4396,6 +4435,7 @@ def _run_job_script_with_claim_heartbeat(
             managed_worker_bind=managed_worker_bind,
             managed_worker_ack=managed_worker_ack,
             managed_worker_abort=managed_worker_abort,
+            managed_worker_release_abort=managed_worker_release_abort,
             managed_capability_env_name=managed_capability_env_name,
         )
 
@@ -4435,6 +4475,7 @@ def _run_job_script_with_claim_heartbeat(
             managed_worker_bind=managed_worker_bind,
             managed_worker_ack=managed_worker_ack,
             managed_worker_abort=managed_worker_abort,
+            managed_worker_release_abort=managed_worker_release_abort,
             managed_capability_env_name=managed_capability_env_name,
         )
 
@@ -4446,6 +4487,7 @@ def _run_job_script_with_claim_heartbeat(
             managed_worker_bind=managed_worker_bind,
             managed_worker_ack=managed_worker_ack,
             managed_worker_abort=managed_worker_abort,
+            managed_worker_release_abort=managed_worker_release_abort,
             managed_capability_env_name=managed_capability_env_name,
         )
     finally:
@@ -5507,6 +5549,7 @@ def run_job(
         _managed_worker_bind = None
         _managed_worker_ack = None
         _managed_worker_abort = None
+        _managed_worker_release_abort = None
         if _managed_context is not None:
             _managed_execution_id = job.get("execution_id")
             if not isinstance(_managed_execution_id, str) or not _managed_execution_id:
@@ -5615,9 +5658,35 @@ def run_job(
                         job_id,
                     )
 
+            def _rollback_no_agent_worker_start():
+                nonlocal _prepared, _acknowledged
+                if not _acknowledged:
+                    _abort_no_agent_worker()
+                    return
+                try:
+                    cleared = clear_managed_worker_start(
+                        _managed_execution_id, **_binding_kwargs
+                    )
+                except Exception:
+                    cleared = False
+                    logger.error(
+                        "Job '%s': managed no_agent start rollback failed",
+                        job_id,
+                        exc_info=True,
+                    )
+                if cleared:
+                    _prepared = False
+                    _acknowledged = False
+                else:
+                    logger.error(
+                        "Job '%s': managed no_agent start rollback was refused",
+                        job_id,
+                    )
+
             _managed_worker_bind = _prepare_no_agent_worker
             _managed_worker_ack = _ack_no_agent_worker
             _managed_worker_abort = _abort_no_agent_worker
+            _managed_worker_release_abort = _rollback_no_agent_worker_start
 
         try:
             _script_runner_kwargs = {
@@ -5631,6 +5700,7 @@ def run_job(
                         "managed_worker_bind": _managed_worker_bind,
                         "managed_worker_ack": _managed_worker_ack,
                         "managed_worker_abort": _managed_worker_abort,
+                        "managed_worker_release_abort": _managed_worker_release_abort,
                         "managed_capability_env_name": _managed_context[
                             "execution_capability_env"
                         ],
