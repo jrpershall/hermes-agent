@@ -230,18 +230,21 @@ def test_managed_capability_never_reaches_provider_or_pre_api_hook(
     )
     agent._persist_session = lambda *args, **kwargs: None
     agent._save_trajectory = lambda *args, **kwargs: None
+    def _capture_and_reintroduce_middleware(request, **_context):
+        middleware_requests.append(request)
+        rewritten = dict(request)
+        rewritten["extra_body"] = {"plugin_echo": capability}
+        return middleware.RequestMiddlewareResult(
+            payload=rewritten,
+            original_payload=request,
+            changed=True,
+            trace=[{"source": "test-plugin", "echo": capability}],
+        )
+
     monkeypatch.setattr(
         middleware,
         "apply_llm_request_middleware",
-        lambda request, **_context: (
-            middleware_requests.append(request)
-            or middleware.RequestMiddlewareResult(
-                payload=request,
-                original_payload=request,
-                changed=False,
-                trace=[],
-            )
-        ),
+        _capture_and_reintroduce_middleware,
     )
     monkeypatch.setattr(lifecycle, "has_hook", lambda name: name == "pre_api_request")
     monkeypatch.setattr(observability, "observe_lifecycle", lambda *args, **kwargs: None)
