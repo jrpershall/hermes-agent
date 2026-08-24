@@ -3970,6 +3970,7 @@ def _resolve_job_script_path(script_path: str) -> tuple[Optional[Path], Optional
 
 
 _MANAGED_SCRIPT_BOOTSTRAP_ACK = "HERMES_MANAGED_SCRIPT_WORKER_STARTED_V1"
+_MANAGED_SCRIPT_BOOTSTRAP_RELEASE = "HERMES_MANAGED_SCRIPT_EXECUTE_V1"
 _MANAGED_SCRIPT_BOOTSTRAP = """\
 import json, os, subprocess, sys
 line = sys.stdin.buffer.readline()
@@ -3979,6 +3980,10 @@ bindings = json.loads(line.decode("utf-8"))
 env = os.environ.copy()
 env.update(bindings)
 argv = json.loads(sys.argv[1])
+print("HERMES_MANAGED_SCRIPT_WORKER_STARTED_V1", flush=True)
+release = sys.stdin.buffer.readline()
+if release.decode("utf-8", errors="replace").strip() != "HERMES_MANAGED_SCRIPT_EXECUTE_V1":
+    sys.exit(126)
 worker = subprocess.Popen(
     argv,
     env=env,
@@ -3986,7 +3991,6 @@ worker = subprocess.Popen(
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
 )
-print("HERMES_MANAGED_SCRIPT_WORKER_STARTED_V1", flush=True)
 stdout, stderr = worker.communicate()
 sys.stdout.buffer.write(stdout or b"")
 sys.stderr.buffer.write(stderr or b"")
@@ -4208,8 +4212,6 @@ def _run_job_script(
                 assert proc.stdin is not None
                 proc.stdin.write(json.dumps(bindings) + "\n")
                 proc.stdin.flush()
-                proc.stdin.close()
-                proc.stdin = None
             except Exception as exc:
                 if managed_worker_abort is not None:
                     managed_worker_abort()
@@ -4227,6 +4229,9 @@ def _run_job_script(
                 )
             )
             if bootstrap_ack != _MANAGED_SCRIPT_BOOTSTRAP_ACK:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+                    proc.stdin = None
                 if managed_worker_abort is not None:
                     managed_worker_abort()
                 _terminate_cron_script_process(proc)
@@ -4238,6 +4243,9 @@ def _run_job_script(
             if managed_worker_ack is not None:
                 acknowledged, acknowledgement_error = managed_worker_ack()
                 if not acknowledged:
+                    if proc.stdin is not None:
+                        proc.stdin.close()
+                        proc.stdin = None
                     if managed_worker_abort is not None:
                         managed_worker_abort()
                     _terminate_cron_script_process(proc)
@@ -4246,6 +4254,19 @@ def _run_job_script(
                         acknowledgement_error
                         or "Managed worker script start acknowledgement was refused"
                     )
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(_MANAGED_SCRIPT_BOOTSTRAP_RELEASE + "\n")
+                proc.stdin.flush()
+                proc.stdin.close()
+                proc.stdin = None
+            except Exception as exc:
+                _terminate_cron_script_process(proc)
+                _drain_script_pipes(proc)
+                return False, (
+                    "Managed worker script release failed after durable acknowledgement: "
+                    f"{type(exc).__name__}"
+                )
         deadline = time.monotonic() + script_timeout
         while True:
             if cancel_event is not None and cancel_event.is_set():

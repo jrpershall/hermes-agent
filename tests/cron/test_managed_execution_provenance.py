@@ -705,6 +705,9 @@ def test_managed_no_agent_acknowledgement_refusal_reaps_and_clears_reservation(
 
     assert len(spawned) == 1
     assert spawned[0].poll() is not None
+    # The bootstrap may announce readiness, but the real script remains behind
+    # the parent release barrier until durable acknowledgement succeeds.
+    assert not (home / "no-agent-worker-env.json").exists()
     (row,) = executions.list_executions(job_id=job["id"])
     assert row["status"] == "failed"
     assert all(row[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS)
