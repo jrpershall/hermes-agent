@@ -542,11 +542,29 @@ def validate_managed_execution_context(value: Any) -> Optional[Dict[str, str]]:
             "managed_execution_context.execution_id_env and "
             "execution_capability_env must be distinct"
         )
-    return {
+    normalized = {
         "lane_id": lane_id,
         "execution_id_env": value["execution_id_env"],
         "execution_capability_env": value["execution_capability_env"],
     }
+    from tools.environments.local import register_managed_execution_env_names
+
+    register_managed_execution_env_names(
+        (normalized["execution_id_env"], normalized["execution_capability_env"])
+    )
+    return normalized
+
+
+def _register_loaded_managed_execution_env_names(jobs: List[Dict[str, Any]]) -> None:
+    """Register valid stored declaration names before any job can bind."""
+    for job in jobs:
+        if not isinstance(job, dict) or job.get("managed_execution_context") is None:
+            continue
+        try:
+            validate_managed_execution_context(job["managed_execution_context"])
+        except ValueError:
+            # Dispatch performs authoritative fail-closed validation and pause.
+            continue
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1509,6 +1527,7 @@ def load_jobs() -> List[Dict[str, Any]]:
                 logger.warning("Auto-repaired jobs.json (id-keyed jobs map flattened to list)")
             else:
                 logger.warning("Auto-repaired jobs.json (had invalid control characters)")
+        _register_loaded_managed_execution_env_names(jobs)
         _record_load_stamp(pre_read_stamp)
         return jobs
     if isinstance(data, list):
@@ -1517,6 +1536,7 @@ def load_jobs() -> List[Dict[str, Any]]:
         if data:
             save_jobs(data)
             logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
+        _register_loaded_managed_execution_env_names(data)
         _record_load_stamp(pre_read_stamp)
         return data
 

@@ -2347,7 +2347,7 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
-                _batch_rows.append({
+                _batch_rows.append(self._redact_managed_execution_content({
                     "role": role,
                     "content": content,
                     "tool_name": msg.get("tool_name"),
@@ -2387,7 +2387,7 @@ class AIAgent:
                         else msg.get("display_kind")
                     ),
                     "display_metadata": msg.get("display_metadata"),
-                })
+                }))
                 _batch_msgs.append(msg)
             # One transaction for the whole turn's new rows (typically 3-8
             # messages): one BEGIN IMMEDIATE / commit — and, off WAL, one
@@ -3142,6 +3142,26 @@ class AIAgent:
         return content.strip()
 
     @staticmethod
+    def _redact_managed_execution_content(content):
+        """Recursively redact the live managed capability from durable data."""
+        from tools.environments.local import redact_managed_execution_capability
+
+        if isinstance(content, str):
+            return redact_managed_execution_capability(content)
+        if isinstance(content, list):
+            return [AIAgent._redact_managed_execution_content(item) for item in content]
+        if isinstance(content, tuple):
+            return tuple(
+                AIAgent._redact_managed_execution_content(item) for item in content
+            )
+        if isinstance(content, dict):
+            return {
+                key: AIAgent._redact_managed_execution_content(value)
+                for key, value in content.items()
+            }
+        return content
+
+    @staticmethod
     def _redact_message_content(content):
         """Apply secret redaction to message content (str or list-of-parts).
 
@@ -3154,19 +3174,24 @@ class AIAgent:
         Respects ``HERMES_REDACT_SECRETS`` via ``redact_sensitive_text`` —
         when disabled the helper is effectively a no-op.
         """
+        def _redact_text(text: str) -> str:
+            return AIAgent._redact_managed_execution_content(
+                redact_sensitive_text(text)
+            )
+
         if content is None:
             return content
         if isinstance(content, str):
-            return redact_sensitive_text(content)
+            return _redact_text(content)
         if isinstance(content, list):
             redacted = []
             for part in content:
                 if isinstance(part, dict):
                     part = dict(part)
                     if isinstance(part.get("text"), str):
-                        part["text"] = redact_sensitive_text(part["text"])
+                        part["text"] = _redact_text(part["text"])
                     if isinstance(part.get("content"), str):
-                        part["content"] = redact_sensitive_text(part["content"])
+                        part["content"] = _redact_text(part["content"])
                 redacted.append(part)
             return redacted
         return content

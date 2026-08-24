@@ -4051,6 +4051,7 @@ def _run_job_script(
         Callable[[], tuple[bool, Optional[str]]]
     ] = None,
     managed_worker_abort: Optional[Callable[[], None]] = None,
+    managed_capability_env_name: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4159,6 +4160,8 @@ def _run_job_script(
         )
         managed_values: tuple[str, ...] = ()
         if managed_worker_bind is not None:
+            if not managed_capability_env_name:
+                raise ValueError("managed capability env name is required for script binding")
             if cancel_event is not None and cancel_event.is_set():
                 if proc.stdin is not None:
                     proc.stdin.close()
@@ -4183,7 +4186,9 @@ def _run_job_script(
                     proc.stdin = None
                 _drain_script_pipes(proc)
                 return False, binding_error or "Managed worker binding was refused"
-            managed_values = tuple(bindings.values())
+            managed_values = (
+                bindings[managed_capability_env_name],
+            )
             try:
                 assert proc.stdin is not None
                 proc.stdin.write(json.dumps(bindings) + "\n")
@@ -4250,13 +4255,17 @@ def _run_job_script(
         # return path can persist or deliver worker-controlled output.
         try:
             from agent.redact import redact_sensitive_text
-            from tools.environments.local import redact_managed_execution_values
+            from tools.environments.local import redact_managed_execution_capability
 
-            stdout = redact_managed_execution_values(
-                redact_sensitive_text(stdout), extra_values=managed_values
+            stdout = redact_managed_execution_capability(
+                redact_sensitive_text(stdout),
+                capability_env_name=managed_capability_env_name or "",
+                extra_values=managed_values,
             )
-            stderr = redact_managed_execution_values(
-                redact_sensitive_text(stderr), extra_values=managed_values
+            stderr = redact_managed_execution_capability(
+                redact_sensitive_text(stderr),
+                capability_env_name=managed_capability_env_name or "",
+                extra_values=managed_values,
             )
         except Exception as e:
             logger.warning("Failed to redact sensitive text from output: %s", e)
@@ -4289,6 +4298,7 @@ def _run_job_script_with_claim_heartbeat(
         Callable[[], tuple[bool, Optional[str]]]
     ] = None,
     managed_worker_abort: Optional[Callable[[], None]] = None,
+    managed_capability_env_name: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -4317,6 +4327,7 @@ def _run_job_script_with_claim_heartbeat(
             managed_worker_bind=managed_worker_bind,
             managed_worker_ack=managed_worker_ack,
             managed_worker_abort=managed_worker_abort,
+            managed_capability_env_name=managed_capability_env_name,
         )
 
     job_id = str(job.get("id") or "")
@@ -4355,6 +4366,7 @@ def _run_job_script_with_claim_heartbeat(
             managed_worker_bind=managed_worker_bind,
             managed_worker_ack=managed_worker_ack,
             managed_worker_abort=managed_worker_abort,
+            managed_capability_env_name=managed_capability_env_name,
         )
 
     try:
@@ -4365,6 +4377,7 @@ def _run_job_script_with_claim_heartbeat(
             managed_worker_bind=managed_worker_bind,
             managed_worker_ack=managed_worker_ack,
             managed_worker_abort=managed_worker_abort,
+            managed_capability_env_name=managed_capability_env_name,
         )
     finally:
         stop.set()
@@ -4819,6 +4832,23 @@ def _managed_execution_context(job: dict) -> Optional[dict]:
     from cron.jobs import validate_managed_execution_context
 
     return validate_managed_execution_context(job["managed_execution_context"])
+
+
+def _redact_managed_agent_egress(value: Any, managed_context: Optional[dict]) -> str:
+    """Redact the live managed capability from agent-controlled egress text."""
+    text = str(value)
+    if managed_context is None:
+        return text
+    try:
+        from tools.environments.local import redact_managed_execution_capability
+
+        return redact_managed_execution_capability(
+            text,
+            capability_env_name=managed_context["execution_capability_env"],
+        )
+    except Exception:
+        logger.warning("Managed agent egress redaction failed", exc_info=True)
+        return "[REDACTED - managed execution redaction failed]"
 
 
 def _refuse_managed_dispatch(
@@ -5526,11 +5556,15 @@ def run_job(
                 "cancel_event": cancel_event,
             }
             if _managed_worker_bind is not None:
+                assert _managed_context is not None
                 _script_runner_kwargs.update(
                     {
                         "managed_worker_bind": _managed_worker_bind,
                         "managed_worker_ack": _managed_worker_ack,
                         "managed_worker_abort": _managed_worker_abort,
+                        "managed_capability_env_name": _managed_context[
+                            "execution_capability_env"
+                        ],
                     }
                 )
             ok, output = _run_job_script_with_claim_heartbeat(
@@ -6005,7 +6039,8 @@ def run_job(
                 {
                     _managed_context["execution_id_env"]: _managed_execution_id,
                     _managed_context["execution_capability_env"]: _managed_capability,
-                }
+                },
+                capability_env_name=_managed_context["execution_capability_env"],
             )
             del _managed_capability
             logger.info(
@@ -6689,7 +6724,9 @@ def run_job(
         # Guard against non-dict returns from run_conversation under error conditions
         if not isinstance(result, dict):
             raise RuntimeError(
-                f"agent.run_conversation returned {type(result).__name__} instead of dict: {result!r}"
+                "agent.run_conversation returned "
+                f"{type(result).__name__} instead of dict: "
+                f"{_redact_managed_agent_egress(repr(result), _managed_context)}"
             )
 
         # If the agent itself reported failure (e.g. all retries exhausted on
@@ -6700,7 +6737,9 @@ def run_job(
         # job's `last_status` set to "ok". Raise so the except handler below
         # builds the proper failure tuple. (issue #17855)
         turn_exit_reason = str(result.get("turn_exit_reason") or "")
-        final_response_text = (result.get("final_response") or "").strip()
+        final_response_text = _redact_managed_agent_egress(
+            result.get("final_response") or "", _managed_context
+        ).strip()
         max_iteration_summary = (
             result.get("failed") is not True
             and result.get("completed") is False
@@ -6709,7 +6748,11 @@ def run_job(
         )
         if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
             _err_text = (
-                result.get("error")
+                _redact_managed_agent_egress(
+                    result.get("error"), _managed_context
+                )
+                if result.get("error")
+                else None
                 or final_response_text
                 or "agent reported failure"
             )
@@ -6721,7 +6764,7 @@ def run_job(
                 job_name,
             )
 
-        final_response = result.get("final_response", "") or ""
+        final_response = final_response_text
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
@@ -6808,8 +6851,17 @@ def run_job(
         return True, output, final_response, None
 
     except Exception as e:
-        error_msg = f"{type(e).__name__}: {str(e)}"
-        logger.exception("Job '%s' failed: %s", job_name, error_msg)
+        error_msg = (
+            f"{type(e).__name__}: "
+            f"{_redact_managed_agent_egress(str(e), _managed_context)}"
+        )
+        if _managed_context is not None:
+            # The original traceback may contain the raw capability even when
+            # its rendered error text has been redacted. Keep managed failures
+            # diagnostic without serializing agent-controlled traceback bytes.
+            logger.error("Job '%s' failed: %s", job_name, error_msg)
+        else:
+            logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Best-effort audit write on failure path. _audit_fire_id
         # may be unset if the exception fired before submit() — guard
         # with a None check so the audit write itself never raises.

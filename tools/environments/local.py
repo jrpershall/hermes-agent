@@ -35,17 +35,17 @@ logger = logging.getLogger(__name__)
 _MANAGED_EXECUTION_ENV: ContextVar[tuple[tuple[str, str], ...] | None] = ContextVar(
     "hermes_managed_execution_env", default=None
 )
+_MANAGED_EXECUTION_CAPABILITY_ENV_NAME: ContextVar[str | None] = ContextVar(
+    "hermes_managed_execution_capability_env_name", default=None
+)
 _MANAGED_EXECUTION_DEFAULT_ENV_NAMES = (
     "HERMES_MANAGED_EXECUTION_ID",
     "HERMES_MANAGED_EXECUTION_CAPABILITY",
 )
-# Every env name that has ever carried a principal in this process (the
-# defaults plus any validated operator-configured names seen at declaration or
-# bind time). Stripped
-# from every child env while no binding is active, so a stale inherited copy
-# under such a name can never masquerade as a live principal. (Names declared
-# by the scheduler before it builds a gate/script environment; the defaults
-# are always present from import time.)
+# Every env name declared for a principal in this process (the defaults plus
+# validated operator-configured names registered at job creation or startup).
+# Stripped from every child env while no binding is active, so a stale inherited
+# copy under such a name can never masquerade as a live principal.
 # Immutable snapshot swapped under a lock: child envs are built from the
 # parallel cron pool while another job may be binding a new name, and
 # iterating a mutating set raises mid-spawn.
@@ -56,7 +56,7 @@ _MANAGED_EXECUTION_NAMES_LOCK = threading.Lock()
 
 
 def register_managed_execution_env_names(names: "Iterable[str]") -> None:
-    """Register validated declaration names for inherited-value scrubbing."""
+    """Register validated declaration names for stale inherited-value stripping."""
     global _MANAGED_EXECUTION_KNOWN_ENV_NAMES
     new = frozenset(names) - _MANAGED_EXECUTION_KNOWN_ENV_NAMES
     if not new:
@@ -66,27 +66,48 @@ def register_managed_execution_env_names(names: "Iterable[str]") -> None:
 
 
 def bind_managed_execution_env(
-    bindings: "Mapping[str, str]",
-) -> Token[tuple[tuple[str, str], ...] | None]:
+    bindings: "Mapping[str, str]", *, capability_env_name: str | None = None
+) -> tuple[Token[tuple[tuple[str, str], ...] | None], Token[str | None]]:
     """Bind managed-execution env pairs to the current context; returns a reset token."""
     items = tuple((str(name), str(value)) for name, value in dict(bindings).items())
     if not items or any(not name or not value for name, value in items):
         raise ValueError("managed execution env bindings must be non-empty name/value pairs")
+    if capability_env_name is not None and capability_env_name not in dict(items):
+        raise ValueError("managed capability env name must identify a bound value")
+    if capability_env_name is None and _MANAGED_EXECUTION_DEFAULT_ENV_NAMES[1] in dict(items):
+        capability_env_name = _MANAGED_EXECUTION_DEFAULT_ENV_NAMES[1]
     register_managed_execution_env_names(name for name, _value in items)
-    return _MANAGED_EXECUTION_ENV.set(items)
+    return (
+        _MANAGED_EXECUTION_ENV.set(items),
+        _MANAGED_EXECUTION_CAPABILITY_ENV_NAME.set(capability_env_name),
+    )
 
 
-def reset_managed_execution_env(token: Token[tuple[tuple[str, str], ...] | None]) -> None:
-    _MANAGED_EXECUTION_ENV.reset(token)
+def reset_managed_execution_env(
+    token: tuple[Token[tuple[tuple[str, str], ...] | None], Token[str | None]],
+) -> None:
+    env_token, capability_name_token = token
+    _MANAGED_EXECUTION_CAPABILITY_ENV_NAME.reset(capability_name_token)
+    _MANAGED_EXECUTION_ENV.reset(env_token)
 
 
-def redact_managed_execution_values(
-    text: str, *, extra_values: "Iterable[str]" = ()
+def redact_managed_execution_capability(
+    text: str,
+    *,
+    capability_env_name: str | None = None,
+    extra_values: "Iterable[str]" = (),
 ) -> str:
-    """Remove bound principal values before worker output crosses its boundary."""
+    """Remove only the managed capability before worker output crosses its boundary."""
     redacted = str(text)
     binding = _MANAGED_EXECUTION_ENV.get()
-    values = [value for _name, value in binding] if binding is not None else []
+    capability_env_name = (
+        capability_env_name or _MANAGED_EXECUTION_CAPABILITY_ENV_NAME.get()
+    )
+    values = (
+        [value for name, value in binding if name == capability_env_name]
+        if binding is not None
+        else []
+    )
     values.extend(str(value) for value in extra_values)
     # Longest first avoids leaving a longer secret partially exposed when one
     # configured value happens to contain another.

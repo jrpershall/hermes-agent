@@ -59,8 +59,10 @@ TOKEN_LIKE_RE = re.compile(r"[A-Za-z0-9_-]{40,}")
 def _principal_never_outlives_a_test():
     """Attribute a leak to the test that caused it, not to the next one."""
     assert local._MANAGED_EXECUTION_ENV.get() is None
+    assert local._MANAGED_EXECUTION_CAPABILITY_ENV_NAME.get() is None
     yield
     assert local._MANAGED_EXECUTION_ENV.get() is None
+    assert local._MANAGED_EXECUTION_CAPABILITY_ENV_NAME.get() is None
 
 
 @pytest.fixture
@@ -111,6 +113,17 @@ def _write_no_agent_leaky_worker(home: Path) -> str:
         encoding="utf-8",
     )
     return "no_agent_leaky_worker.py"
+
+
+def _write_no_agent_identity_echo_worker(home: Path) -> str:
+    script = home / "scripts" / "no_agent_identity_echo_worker.py"
+    script.write_text(
+        "import os\n"
+        f"print(os.environ[{ID_ENV!r}])\n"
+        f"print(os.environ[{CAP_ENV!r}])\n",
+        encoding="utf-8",
+    )
+    return script.name
 
 
 class _RunJobStubs:
@@ -275,6 +288,114 @@ def test_managed_wake_agent_execution_gets_one_durable_principal(
     assert ID_ENV not in local.build_subprocess_env({})
     assert CAP_ENV not in local.hermes_subprocess_env()
     assert ID_ENV not in os.environ and CAP_ENV not in os.environ
+
+
+def test_managed_agent_output_cannot_persist_or_deliver_raw_capability(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    raw = "managed-agent-capability-must-never-leave-worker"
+    monkeypatch.setattr(scheduler.secrets, "token_urlsafe", lambda _n: raw)
+    stubs = _RunJobStubs(monkeypatch, tmp_path)
+    delivered: list[str] = []
+
+    class LeakyAgent:
+        def __init__(self, **kwargs):
+            stubs.observed["session_id"] = kwargs.get("session_id")
+
+        def run_conversation(self, *_a, **_kw):
+            capability = local.build_subprocess_env({})[CAP_ENV]
+            return {
+                "final_response": f"worker echoed {capability}",
+                "messages": [{"role": "assistant", "content": capability}],
+            }
+
+        def get_activity_summary(self):
+            return {"seconds_since_activity": 0.0}
+
+    import run_agent as fake_mod
+
+    fake_mod.AIAgent = LeakyAgent
+    monkeypatch.setattr(
+        scheduler,
+        "_deliver_result",
+        lambda _job, content, **_kw: delivered.append(content),
+    )
+    job = _managed_job(_write_gate(home, wake=True), deliver="local")
+
+    with caplog.at_level("DEBUG"):
+        assert scheduler.run_one_job(job) is True
+
+    assert stubs.observed["docs"]
+    assert delivered
+    assert "[REDACTED_MANAGED_EXECUTION_PRINCIPAL]" in "\n".join(
+        stubs.observed["docs"]
+    )
+    assert "[REDACTED_MANAGED_EXECUTION_PRINCIPAL]" in "\n".join(delivered)
+    assert raw not in "\n".join(stubs.observed["docs"])
+    assert raw not in "\n".join(delivered)
+    assert not any(raw in str(run) for run in stubs.observed.get("runs", []))
+    assert raw not in caplog.text
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as db:
+        assert raw not in "\n".join(db.iterdump())
+
+
+@pytest.mark.parametrize("failure_mode", ["reported", "raised"])
+def test_managed_agent_error_cannot_persist_log_or_deliver_raw_capability(
+    failure_mode: str,
+    home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    raw = "managed-agent-error-capability-must-not-escape"
+    monkeypatch.setattr(scheduler.secrets, "token_urlsafe", lambda _n: raw)
+    stubs = _RunJobStubs(monkeypatch, tmp_path)
+    delivered: list[str] = []
+
+    class FailingAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, *_a, **_kw):
+            capability = local.build_subprocess_env({})[CAP_ENV]
+            if failure_mode == "raised":
+                raise RuntimeError(f"worker raised with {capability}")
+            return {
+                "failed": True,
+                "completed": False,
+                "error": f"worker failed with {capability}",
+                "final_response": capability,
+                "messages": [],
+            }
+
+        def get_activity_summary(self):
+            return {"seconds_since_activity": 0.0}
+
+    import run_agent as fake_mod
+
+    fake_mod.AIAgent = FailingAgent
+    monkeypatch.setattr(
+        scheduler,
+        "_deliver_result",
+        lambda _job, content, **_kw: delivered.append(content),
+    )
+    job = _managed_job(_write_gate(home, wake=True), deliver="local")
+
+    with caplog.at_level("DEBUG"):
+        assert scheduler.run_one_job(job) is True
+
+    blob = "\n".join(
+        [
+            *stubs.observed["docs"],
+            *delivered,
+            caplog.text,
+            *(str(run) for run in stubs.observed.get("runs", [])),
+        ]
+    )
+    assert raw not in blob
+    assert "[REDACTED_MANAGED_EXECUTION_PRINCIPAL]" in blob
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as db:
+        assert raw not in "\n".join(db.iterdump())
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +710,23 @@ def test_managed_no_agent_output_cannot_persist_or_deliver_raw_capability(
         assert raw not in "\n".join(db.iterdump())
 
 
+def test_managed_no_agent_output_preserves_execution_id_while_redacting_capability(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = "managed-no-agent-capability-must-not-escape"
+    monkeypatch.setattr(scheduler.secrets, "token_urlsafe", lambda _n: raw)
+    stubs = _RunJobStubs(monkeypatch, tmp_path)
+    job = _managed_job(_write_no_agent_identity_echo_worker(home), no_agent=True)
+
+    assert scheduler.run_one_job(job) is True
+
+    (row,) = executions.list_executions(job_id=job["id"])
+    saved = "\n".join(stubs.observed["docs"])
+    assert row["id"] in saved
+    assert "[REDACTED_MANAGED_EXECUTION_PRINCIPAL]" in saved
+    assert raw not in saved
+
+
 def test_managed_no_agent_missing_script_creates_no_worker_evidence(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -684,6 +822,51 @@ def test_valid_managed_context_round_trips_and_undeclared_jobs_are_untouched(
         assert cleared.get("managed_execution_context") is None
 
 
+@pytest.mark.parametrize("declaration_path", ["create", "startup_load"])
+def test_custom_managed_env_names_are_stripped_as_soon_as_declared(
+    declaration_path: str, home: Path
+) -> None:
+    from cron.jobs import create_job, load_jobs, use_cron_store
+
+    suffix = declaration_path.upper()
+    custom_id = f"DECLARED_{suffix}_EXECUTION_ID"
+    custom_cap = f"DECLARED_{suffix}_EXECUTION_CAPABILITY"
+    context = {
+        "lane_id": "repair-3",
+        "execution_id_env": custom_id,
+        "execution_capability_env": custom_cap,
+    }
+
+    with use_cron_store(home):
+        if declaration_path == "create":
+            create_job(
+                prompt="p",
+                schedule="every 1m",
+                managed_execution_context=context,
+            )
+        else:
+            (home / "cron" / "jobs.json").write_text(
+                json.dumps(
+                    {
+                        "jobs": [
+                            {
+                                "id": "startup-managed",
+                                "prompt": "p",
+                                "managed_execution_context": context,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            load_jobs()
+
+    stale = {custom_id: "stale-id", custom_cap: "stale-capability"}
+    assert custom_id not in local.build_subprocess_env(stale)
+    assert custom_cap not in local.build_subprocess_env(stale)
+    assert local._MANAGED_EXECUTION_ENV.get() is None
+
+
 @pytest.mark.parametrize(
     "case", ["missing-lane", "protected-PATH", "duplicate-env-names"]
 )
@@ -753,6 +936,7 @@ def test_binding_write_failure_blocks_dispatch(
     assert rows[0]["worker_started_at"] is None
     assert "managed execution" in rows[0]["error"].lower()
     blob = rows[0]["error"] + caplog.text + "\n".join(stubs.observed.get("docs", []))
+    blob = blob.replace(str(Path(__file__).resolve().parents[2]), "")
     assert not TOKEN_LIKE_RE.search(blob.replace(rows[0]["id"], ""))
     assert ID_ENV not in local.build_subprocess_env({})
 

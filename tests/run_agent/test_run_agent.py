@@ -117,6 +117,45 @@ def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
     assert api_content[0]["text"] == "[MODEL SWITCH NOTE]\n\nDescribe this screenshot"
 
 
+def test_managed_capability_is_redacted_from_durable_tool_result(agent):
+    from tools.environments import local
+
+    execution_id = "managed-execution-id-remains-visible"
+    capability = "managed-capability-must-not-enter-session-db"
+    agent._session_db = MagicMock()
+    agent._session_db_created = True
+    agent.session_id = "managed-session"
+    agent._last_flushed_db_idx = 0
+    agent._persist_user_message_idx = None
+    agent._persist_user_message_override = None
+    agent._persist_user_message_timestamp = None
+    token = local.bind_managed_execution_env(
+        {
+            "HERMES_MANAGED_EXECUTION_ID": execution_id,
+            "HERMES_MANAGED_EXECUTION_CAPABILITY": capability,
+        }
+    )
+    try:
+        agent._flush_messages_to_session_db(
+            [
+                {
+                    "role": "tool",
+                    "content": f"id={execution_id} capability={capability}",
+                    "tool_call_id": "call-managed",
+                }
+            ],
+            [],
+        )
+    finally:
+        local.reset_managed_execution_env(token)
+
+    batch = agent._session_db.append_messages_batch.call_args.kwargs["messages"]
+    persisted = batch[0]["content"]
+    assert execution_id in persisted
+    assert capability not in persisted
+    assert "[REDACTED_MANAGED_EXECUTION_PRINCIPAL]" in persisted
+
+
 def test_direct_session_db_flushes_share_marker_claim(agent):
     """A direct flush cannot interleave its marker check with `_persist_session`."""
     class _BarrierDB:
