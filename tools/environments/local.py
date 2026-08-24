@@ -15,6 +15,7 @@ import threading
 from collections.abc import Iterable, Mapping
 from contextvars import ContextVar, Token
 from pathlib import Path
+from typing import Any
 
 from hermes_constants import get_process_hermes_home
 from tools.environments.base import BaseEnvironment, _pipe_stdin
@@ -115,6 +116,26 @@ def redact_managed_execution_capability(
         if value:
             redacted = redacted.replace(value, "[REDACTED_MANAGED_EXECUTION_PRINCIPAL]")
     return redacted
+
+
+def redact_managed_execution_payload(value: Any) -> Any:
+    """Recursively remove the live managed capability from outbound data.
+
+    Execution IDs are provenance, not secrets, and deliberately remain
+    visible.  Only the raw per-execution capability is removed.
+    """
+    if isinstance(value, str):
+        return redact_managed_execution_capability(value)
+    if isinstance(value, list):
+        return [redact_managed_execution_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_managed_execution_payload(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: redact_managed_execution_payload(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _inject_managed_execution_env(env: dict[str, str]) -> None:

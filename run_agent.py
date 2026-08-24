@@ -3003,6 +3003,7 @@ class AIAgent:
 
     @classmethod
     def _sanitize_hook_payload(cls, value: Any) -> Any:
+        value = cls._redact_managed_execution_content(value)
         payload = cls._hook_jsonable(value)
         limit = cls._hook_payload_max_chars()
         try:
@@ -3143,23 +3144,10 @@ class AIAgent:
 
     @staticmethod
     def _redact_managed_execution_content(content):
-        """Recursively redact the live managed capability from durable data."""
-        from tools.environments.local import redact_managed_execution_capability
+        """Recursively redact the live managed capability from outbound data."""
+        from tools.environments.local import redact_managed_execution_payload
 
-        if isinstance(content, str):
-            return redact_managed_execution_capability(content)
-        if isinstance(content, list):
-            return [AIAgent._redact_managed_execution_content(item) for item in content]
-        if isinstance(content, tuple):
-            return tuple(
-                AIAgent._redact_managed_execution_content(item) for item in content
-            )
-        if isinstance(content, dict):
-            return {
-                key: AIAgent._redact_managed_execution_content(value)
-                for key, value in content.items()
-            }
-        return content
+        return redact_managed_execution_payload(content)
 
     @staticmethod
     def _redact_message_content(content):

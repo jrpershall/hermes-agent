@@ -156,6 +156,103 @@ def test_managed_capability_is_redacted_from_durable_tool_result(agent):
     assert "[REDACTED_MANAGED_EXECUTION_PRINCIPAL]" in persisted
 
 
+def test_managed_capability_is_redacted_from_provider_and_hook_payloads(
+    agent, monkeypatch
+):
+    from hermes_cli import lifecycle
+    import model_tools
+    from tools.environments import local
+
+    execution_id = "managed-execution-id-remains-visible"
+    capability = "CAPABILITY-RAW-ADVERSARIAL-PROVIDER-EGRESS"
+    custom_id = "WATERLOO_EXECUTION_ID"
+    custom_cap = "WATERLOO_EXECUTION_CAPABILITY"
+    token = local.bind_managed_execution_env(
+        {custom_id: execution_id, custom_cap: capability},
+        capability_env_name=custom_cap,
+    )
+    captured = []
+    monkeypatch.setattr(lifecycle, "has_hook", lambda name: name == "post_tool_call")
+    monkeypatch.setattr(
+        lifecycle,
+        "invoke_hook",
+        lambda name, **payload: captured.append((name, payload)),
+    )
+    try:
+        api_kwargs = {
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "tool",
+                    "content": f"id={execution_id} capability={capability}",
+                    "tool_call_id": "call-managed",
+                }
+            ],
+        }
+        provider_payload = agent._redact_managed_execution_content(api_kwargs)
+        hook_payload = agent._api_request_payload_for_hook(api_kwargs)
+        model_tools._emit_post_tool_call_hook(
+            function_name="terminal",
+            function_args={"command": f"print {execution_id}"},
+            result=f"id={execution_id} capability={capability}",
+        )
+    finally:
+        local.reset_managed_execution_env(token)
+
+    for payload in (provider_payload, hook_payload, captured):
+        encoded = json.dumps(payload, default=str)
+        assert execution_id in encoded
+        assert capability not in encoded
+        assert "[REDACTED_MANAGED_EXECUTION_PRINCIPAL]" in encoded
+
+
+def test_managed_capability_never_reaches_provider_or_pre_api_hook(
+    agent, monkeypatch
+):
+    from hermes_cli import lifecycle, observability, plugins
+    from tools.environments import local
+
+    execution_id = "managed-execution-id-provider-boundary"
+    capability = "CAPABILITY-RAW-MUST-NOT-LEAVE-PROCESS"
+    token = local.bind_managed_execution_env(
+        {
+            "HERMES_MANAGED_EXECUTION_ID": execution_id,
+            "HERMES_MANAGED_EXECUTION_CAPABILITY": capability,
+        },
+        capability_env_name="HERMES_MANAGED_EXECUTION_CAPABILITY",
+    )
+    provider_requests = []
+    hook_calls = []
+    agent._interruptible_api_call = (
+        lambda kwargs: provider_requests.append(kwargs)
+        or _mock_response(content="completed")
+    )
+    agent._persist_session = lambda *args, **kwargs: None
+    agent._save_trajectory = lambda *args, **kwargs: None
+    monkeypatch.setattr(lifecycle, "has_hook", lambda name: name == "pre_api_request")
+    monkeypatch.setattr(observability, "observe_lifecycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        plugins,
+        "invoke_hook",
+        lambda name, **payload: hook_calls.append((name, payload)) or [],
+    )
+    try:
+        result = agent.run_conversation(
+            f"id={execution_id} capability={capability}"
+        )
+    finally:
+        local.reset_managed_execution_env(token)
+
+    assert result["completed"] is True
+    assert provider_requests
+    assert hook_calls
+    for payload in (provider_requests, hook_calls):
+        encoded = json.dumps(payload, default=str)
+        assert execution_id in encoded
+        assert capability not in encoded
+        assert "[REDACTED_MANAGED_EXECUTION_PRINCIPAL]" in encoded
+
+
 def test_direct_session_db_flushes_share_marker_claim(agent):
     """A direct flush cannot interleave its marker check with `_persist_session`."""
     class _BarrierDB:
