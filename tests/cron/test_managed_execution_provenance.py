@@ -55,6 +55,14 @@ TOKEN_LIKE_RE = re.compile(r"[A-Za-z0-9_-]{40,}")
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _principal_never_outlives_a_test():
+    """Attribute a leak to the test that caused it, not to the next one."""
+    assert local._MANAGED_EXECUTION_ENV.get() is None
+    yield
+    assert local._MANAGED_EXECUTION_ENV.get() is None
+
+
 @pytest.fixture
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated HERMES_HOME with a scripts dir, ledger, and cron store."""
@@ -427,7 +435,14 @@ def test_binding_write_failure_blocks_dispatch(
 
 @pytest.mark.parametrize(
     "raise_at",
-    ["session_vars", "cwd_lock_timeout", "delivery_target", "agent_init", "agent_run"],
+    [
+        "session_vars",
+        "cwd_lock_timeout_getter",
+        "cwd_lock_acquire_refused",
+        "delivery_target",
+        "agent_init",
+        "agent_run",
+    ],
 )
 def test_exception_after_bind_releases_the_principal(
     raise_at: str, home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -451,8 +466,16 @@ def test_exception_after_bind_releases_the_principal(
         from gateway import session_context
 
         monkeypatch.setattr(session_context, "set_session_vars", _boom)
-    elif raise_at == "cwd_lock_timeout":
+    elif raise_at == "cwd_lock_timeout_getter":
+        # Still pre-``try``: the timeout getter raises before any bind.
         monkeypatch.setattr(scheduler, "_cwd_lock_timeout_seconds", _boom)
+    elif raise_at == "cwd_lock_acquire_refused":
+        # The REAL lock-timeout path inside the try: acquire returns False and
+        # run_job raises TimeoutError. Must precede the bind — no worker ever
+        # starts, so no worker evidence may be written.
+        monkeypatch.setattr(
+            scheduler._terminal_cwd_lock, "acquire_read", lambda timeout=None: False
+        )
     elif raise_at == "delivery_target":
         monkeypatch.setattr(scheduler, "_resolve_delivery_target", _boom)
     else:
@@ -788,6 +811,50 @@ def test_custom_env_names_are_stripped_when_unbound() -> None:
     stale = {custom_id: "stale-id", custom_cap: "stale-cap"}
     assert custom_id not in local.build_subprocess_env(stale)
     assert custom_cap not in local.build_subprocess_env(stale)
+
+
+def test_registering_new_names_never_breaks_concurrent_env_builds() -> None:
+    """Child envs are built from the parallel cron pool while another job may
+    be binding a NEW custom name; the strip set must be safe to read then.
+
+    Tight loop on the injector itself (the hot path every spawn surface
+    calls) so the window is hit thousands of times within ~1.5s.
+    """
+    import threading
+    import time
+
+    errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def spawner():
+        try:
+            while not stop.is_set():
+                local._inject_managed_execution_env({"A": "1", "B": "2"})
+        except BaseException as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+            stop.set()
+
+    def binder():
+        i = 0
+        deadline = time.monotonic() + 1.5
+        while not stop.is_set() and time.monotonic() < deadline:
+            i += 1
+            token = local.bind_managed_execution_env({
+                f"RACE_ID_{i}": "x",
+                f"RACE_CAP_{i}": "y",
+            })
+            local.reset_managed_execution_env(token)
+        stop.set()
+
+    threads = [threading.Thread(target=spawner) for _ in range(3)] + [
+        threading.Thread(target=binder)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert not errors, repr(errors[:3])
+    assert "RACE_ID_1" in local._MANAGED_EXECUTION_KNOWN_ENV_NAMES
 
 
 def test_env_binding_is_context_local_and_scrubbed_for_delegated_children() -> None:

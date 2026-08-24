@@ -5599,6 +5599,22 @@ def run_job(
     _cron_session_token = None
     _non_dispatcher_token = None
     try:
+        if not _cwd_lock_acquired:
+            # Fail closed (#79768): running without the lock would let a
+            # concurrent workdir job's process-global TERMINAL_CWD override
+            # leak into this job's shell/file/code-exec commands — silent
+            # wrong-directory execution, the exact corruption the lock
+            # exists to prevent. A loud failure is recoverable (next tick /
+            # manual rerun); a job that ran in the wrong directory is not.
+            raise TimeoutError(
+                f"Timed out waiting for the TERMINAL_CWD "
+                f"{'write' if _holds_cwd_write else 'read'} lock after "
+                f"{_cwd_lock_timeout:.0f}s — another cron job (a workdir "
+                f"writer, or long-running readers) has held it for longer "
+                f"than the cron inactivity limit. If a workdir job is the "
+                f"holder, stagger its schedule or remove its workdir to "
+                f"unblock this job (#79768)."
+            )
         # ---------------------------------------------------------------
         # Managed execution: bind the worker to its scheduler-owned execution
         # row NOW — after the script gate said wakeAgent=true and the prompt is
@@ -5609,7 +5625,9 @@ def run_job(
         # that every child-process env built under this run inherits (terminal
         # tool, ACP/codex/claude executors) and is dropped in ``finally``.
         # A gate that returned wakeAgent=false already returned above, so an
-        # idle tick never acquires worker evidence.
+        # idle tick never acquires worker evidence, and the TERMINAL_CWD lock
+        # check above runs first so a lock timeout never writes worker evidence
+        # for a run in which no worker started.
         # This block lives INSIDE the try whose ``finally`` resets the binding:
         # a raise anywhere after the bind (lock timeout, config load, agent
         # construction) must release the raw capability on the way out — the
@@ -5663,22 +5681,6 @@ def run_job(
             logger.info(
                 "Job '%s': managed worker bound to execution %s on lane %s",
                 job_id, _managed_execution_id, _managed_context["lane_id"],
-            )
-        if not _cwd_lock_acquired:
-            # Fail closed (#79768): running without the lock would let a
-            # concurrent workdir job's process-global TERMINAL_CWD override
-            # leak into this job's shell/file/code-exec commands — silent
-            # wrong-directory execution, the exact corruption the lock
-            # exists to prevent. A loud failure is recoverable (next tick /
-            # manual rerun); a job that ran in the wrong directory is not.
-            raise TimeoutError(
-                f"Timed out waiting for the TERMINAL_CWD "
-                f"{'write' if _holds_cwd_write else 'read'} lock after "
-                f"{_cwd_lock_timeout:.0f}s — another cron job (a workdir "
-                f"writer, or long-running readers) has held it for longer "
-                f"than the cron inactivity limit. If a workdir job is the "
-                f"holder, stagger its schedule or remove its workdir to "
-                f"unblock this job (#79768)."
             )
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
