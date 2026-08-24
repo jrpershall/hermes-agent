@@ -30,6 +30,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -121,6 +122,17 @@ def _write_no_agent_identity_echo_worker(home: Path) -> str:
         "import os\n"
         f"print(os.environ[{ID_ENV!r}])\n"
         f"print(os.environ[{CAP_ENV!r}])\n",
+        encoding="utf-8",
+    )
+    return script.name
+
+
+def _write_no_agent_blocking_worker(home: Path) -> str:
+    script = home / "scripts" / "no_agent_blocking_worker.py"
+    script.write_text(
+        "import os, time\n"
+        f"open({str(home / 'blocking-worker-started')!r}, 'w').write(str(os.getpid()))\n"
+        "time.sleep(60)\n",
         encoding="utf-8",
     )
     return script.name
@@ -512,6 +524,27 @@ def test_managed_no_agent_script_is_bound_as_the_worker(
     assert CAP_ENV not in local.hermes_subprocess_env()
 
 
+def test_managed_no_agent_delayed_ack_read_preserves_worker_output(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACK and worker output resident together must share one lossless read path."""
+    stubs = _RunJobStubs(monkeypatch, tmp_path)
+    job = _managed_job(_write_no_agent_worker(home), no_agent=True)
+    real_read_ack = scheduler._read_managed_script_bootstrap_ack
+
+    def _delayed_read_ack(*args, **kwargs):
+        time.sleep(0.3)
+        return real_read_ack(*args, **kwargs)
+
+    monkeypatch.setattr(
+        scheduler, "_read_managed_script_bootstrap_ack", _delayed_read_ack
+    )
+
+    assert scheduler.run_one_job(job) is True
+
+    assert "worker completed" in "\n".join(stubs.observed.get("docs", []))
+
+
 def test_managed_no_agent_scheduler_execution_row_is_bound(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -603,6 +636,123 @@ def test_managed_no_agent_premature_bootstrap_exit_leaves_no_worker_evidence(
     assert row["status"] == "failed"
     assert all(row[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS)
     assert "bootstrap release failed" in (row["error"] or "").lower()
+
+
+@pytest.mark.parametrize("failure_mode", ["timeout", "mismatch"])
+def test_managed_no_agent_missing_ack_reaps_bootstrap_without_running_script(
+    failure_mode: str, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _managed_job(_write_no_agent_worker(home), no_agent=True)
+    real_popen = scheduler.subprocess.Popen
+    spawned: list[subprocess.Popen] = []
+
+    def _silent_or_mismatched_bootstrap(_argv):
+        ack = "print('WRONG_ACK', flush=True);" if failure_mode == "mismatch" else ""
+        code = (
+            "import sys, time;"
+            "sys.stdin.buffer.readline();"
+            f"{ack}"
+            "time.sleep(60)"
+        )
+        return [sys.executable, "-c", code], {}
+
+    def _tracking_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(
+        scheduler, "_managed_script_bootstrap_argv", _silent_or_mismatched_bootstrap
+    )
+    monkeypatch.setattr(scheduler, "_get_script_timeout", lambda: 1)
+    monkeypatch.setattr(scheduler.subprocess, "Popen", _tracking_popen)
+
+    assert scheduler.run_one_job(job) is True
+
+    assert len(spawned) == 1
+    assert spawned[0].poll() is not None
+    assert not (home / "no-agent-worker-env.json").exists()
+    (row,) = executions.list_executions(job_id=job["id"])
+    assert row["status"] == "failed"
+    assert all(row[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS)
+    error = row["error"] or ""
+    assert "acknowledgement" in error.lower()
+    if failure_mode == "timeout":
+        assert "timed out" in error.lower()
+    assert not TOKEN_LIKE_RE.search(error.replace(row["id"], ""))
+
+
+def test_managed_no_agent_acknowledgement_refusal_reaps_and_clears_reservation(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = "managed-refusal-capability-must-not-leak"
+    monkeypatch.setattr(scheduler.secrets, "token_urlsafe", lambda _n: raw)
+    job = _managed_job(_write_no_agent_worker(home), no_agent=True)
+    real_popen = scheduler.subprocess.Popen
+    spawned: list[subprocess.Popen] = []
+
+    def _tracking_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(scheduler.subprocess, "Popen", _tracking_popen)
+    monkeypatch.setattr(
+        scheduler, "acknowledge_managed_worker_started", lambda *_a, **_kw: None
+    )
+
+    assert scheduler.run_one_job(job) is True
+
+    assert len(spawned) == 1
+    assert spawned[0].poll() is not None
+    (row,) = executions.list_executions(job_id=job["id"])
+    assert row["status"] == "failed"
+    assert all(row[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS)
+    error = row["error"] or ""
+    assert "start acknowledgement" in error.lower()
+    assert raw not in error
+    assert not TOKEN_LIKE_RE.search(error.replace(row["id"], ""))
+
+
+def test_managed_no_agent_ack_reader_thread_start_failure_aborts_and_reaps(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = "managed-thread-failure-capability-must-not-leak"
+    monkeypatch.setattr(scheduler.secrets, "token_urlsafe", lambda _n: raw)
+    job = _managed_job(_write_no_agent_blocking_worker(home), no_agent=True)
+    real_popen = scheduler.subprocess.Popen
+    real_thread_start = scheduler.threading.Thread.start
+    spawned: list[subprocess.Popen] = []
+
+    def _tracking_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    def _fail_ack_reader_start(thread):
+        if thread.name == "cron-managed-bootstrap-ack":
+            raise RuntimeError(f"synthetic ack reader thread exhaustion: {raw}")
+        return real_thread_start(thread)
+
+    monkeypatch.setattr(scheduler.subprocess, "Popen", _tracking_popen)
+    monkeypatch.setattr(scheduler.threading.Thread, "start", _fail_ack_reader_start)
+
+    try:
+        assert scheduler.run_one_job(job) is True
+
+        assert len(spawned) == 1
+        assert spawned[0].poll() is not None
+        (row,) = executions.list_executions(job_id=job["id"])
+        assert row["status"] == "failed"
+        assert all(row[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS)
+        assert "thread exhaustion" in (row["error"] or "")
+        assert raw not in (row["error"] or "")
+        assert "[REDACTED_MANAGED_EXECUTION_PRINCIPAL]" in (row["error"] or "")
+    finally:
+        # RED on the predecessor must not leave its orphaned bootstrap alive.
+        for proc in spawned:
+            scheduler._terminate_cron_script_process(proc)
+            scheduler._drain_script_pipes(proc)
 
 
 def test_managed_no_agent_popen_failure_creates_no_worker_evidence(
@@ -1057,6 +1207,105 @@ def _bind(job_id: str = "j", lane: str = "repair-3") -> tuple[dict, str]:
     )
     assert bound is not None
     return bound, capability
+
+
+def test_prepare_and_acknowledge_are_exactly_fenced(home: Path) -> None:
+    digest = "0" * 64
+    other_digest = "1" * 64
+    common = dict(
+        job_id="j",
+        lane_id="repair-3",
+        session_sha256=digest,
+        capability_sha256=digest,
+    )
+    row = executions.create_execution("j", source="builtin")
+
+    # Claimed and terminal rows can never acquire managed evidence.
+    assert executions.prepare_managed_worker(row["id"], **common) is None
+    assert executions.acknowledge_managed_worker_started(row["id"], **common) is None
+    assert executions.finish_execution(row["id"], success=False)
+    assert executions.prepare_managed_worker(row["id"], **common) is None
+    assert executions.acknowledge_managed_worker_started(row["id"], **common) is None
+    assert all(
+        executions.latest_execution("j")[field] is None
+        for field in executions.MANAGED_EXECUTION_COLUMNS
+    )
+
+    running = executions.create_execution("j", source="builtin")
+    assert executions.mark_execution_running(running["id"])
+    # A never-prepared running row cannot be acknowledged.
+    assert (
+        executions.acknowledge_managed_worker_started(running["id"], **common)
+        is None
+    )
+    prepared = executions.prepare_managed_worker(running["id"], **common)
+    assert prepared is not None
+    assert prepared["worker_started_at"] is None
+    assert prepared["lane_id"] == common["lane_id"]
+    assert prepared["session_sha256"] == common["session_sha256"]
+    assert prepared["capability_sha256"] == common["capability_sha256"]
+    assert executions.prepare_managed_worker(running["id"], **common) is None
+
+    for mismatch in (
+        {"job_id": "other"},
+        {"lane_id": "repair-4"},
+        {"session_sha256": other_digest},
+        {"capability_sha256": other_digest},
+    ):
+        assert (
+            executions.acknowledge_managed_worker_started(
+                running["id"], **{**common, **mismatch}
+            )
+            is None
+        )
+
+    acknowledged = executions.acknowledge_managed_worker_started(
+        running["id"], **common
+    )
+    assert acknowledged is not None
+    assert acknowledged["worker_started_at"] >= acknowledged["started_at"]
+    assert all(acknowledged[field] is not None for field in executions.MANAGED_EXECUTION_COLUMNS)
+    assert executions.acknowledge_managed_worker_started(running["id"], **common) is None
+    assert executions.clear_managed_worker_preparation(running["id"], **common) is False
+    persisted = executions.latest_execution("j")
+    assert all(
+        persisted[field] == acknowledged[field]
+        for field in executions.MANAGED_EXECUTION_COLUMNS
+    )
+
+
+def test_clear_preparation_requires_exact_unacknowledged_tuple(home: Path) -> None:
+    digest = "2" * 64
+    other_digest = "3" * 64
+    common = dict(
+        job_id="clear-job",
+        lane_id="repair-3",
+        session_sha256=digest,
+        capability_sha256=digest,
+    )
+    row = executions.create_execution("clear-job", source="builtin")
+    assert executions.mark_execution_running(row["id"])
+    assert executions.prepare_managed_worker(row["id"], **common)
+
+    for mismatch in (
+        {"job_id": "other"},
+        {"lane_id": "repair-4"},
+        {"session_sha256": other_digest},
+        {"capability_sha256": other_digest},
+    ):
+        assert (
+            executions.clear_managed_worker_preparation(
+                row["id"], **{**common, **mismatch}
+            )
+            is False
+        )
+
+    assert executions.clear_managed_worker_preparation(row["id"], **common) is True
+    persisted = executions.latest_execution("clear-job")
+    assert persisted["status"] == "running"
+    assert all(
+        persisted[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS
+    )
 
 
 def test_bind_is_fenced_to_one_running_unbound_row(home: Path) -> None:

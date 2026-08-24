@@ -4016,7 +4016,18 @@ def _read_managed_script_bootstrap_ack(
     def _readline() -> None:
         try:
             assert proc.stdout is not None
-            result["line"] = proc.stdout.readline().strip()
+            # Read the trusted bootstrap line directly from the pipe without
+            # a buffered TextIOWrapper read-ahead. ``communicate()`` later
+            # drains the same descriptor, so worker bytes following the ACK
+            # cannot be stranded in a Python buffer and discarded on POSIX.
+            line = bytearray()
+            fd = proc.stdout.fileno()
+            while True:
+                chunk = os.read(fd, 1)
+                if not chunk or chunk == b"\n":
+                    break
+                line.extend(chunk)
+            result["line"] = line.decode("utf-8", errors="replace").strip()
         except Exception as exc:
             result["error"] = type(exc).__name__
         finally:
@@ -4127,6 +4138,8 @@ def _run_job_script(
         else:
             argv = [python_exe, str(path)]
 
+    proc: Optional[subprocess.Popen] = None
+    managed_values: tuple[str, ...] = ()
     try:
         from tools.environments.local import build_subprocess_env
 
@@ -4158,7 +4171,6 @@ def _run_job_script(
             env=env,
             **popen_kwargs,
         )
-        managed_values: tuple[str, ...] = ()
         if managed_worker_bind is not None:
             if not managed_capability_env_name:
                 raise ValueError("managed capability env name is required for script binding")
@@ -4283,7 +4295,40 @@ def _run_job_script(
         return True, stdout
 
     except Exception as exc:
-        return False, f"Script execution failed: {exc}"
+        # Once the bootstrap exists, every exceptional exit must unwind both
+        # sides of the reservation: clear an unacknowledged ledger tuple and
+        # terminate/reap the complete process tree. This includes failures in
+        # local coordination itself (for example Thread.start exhaustion).
+        if managed_worker_abort is not None:
+            try:
+                managed_worker_abort()
+            except Exception as cleanup_exc:
+                logger.error(
+                    "Managed no_agent preparation cleanup raised unexpectedly (%s)",
+                    type(cleanup_exc).__name__,
+                )
+        if proc is not None:
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+                proc.stdin = None
+            _terminate_cron_script_process(proc)
+            _drain_script_pipes(proc)
+        message = f"Script execution failed: {exc}"
+        try:
+            from agent.redact import redact_sensitive_text
+            from tools.environments.local import redact_managed_execution_capability
+
+            message = redact_managed_execution_capability(
+                redact_sensitive_text(message),
+                capability_env_name=managed_capability_env_name or "",
+                extra_values=managed_values,
+            )
+        except Exception:
+            message = f"Script execution failed: {type(exc).__name__}"
+        return False, message
 
 
 def _run_job_script_with_claim_heartbeat(
