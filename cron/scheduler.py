@@ -3930,6 +3930,39 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+def _resolve_job_script_path(script_path: str) -> tuple[Optional[Path], Optional[str]]:
+    """Resolve and validate a cron script without starting a worker process."""
+    scripts_dir = _get_hermes_home() / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    scripts_dir_resolved = scripts_dir.resolve()
+
+    if "\x00" in str(script_path):
+        return None, f"Blocked: script path contains a NUL byte: {script_path!r}"
+
+    try:
+        raw = Path(script_path).expanduser()
+    except (ValueError, RuntimeError, OSError):
+        return None, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
+    if raw.is_absolute():
+        path = raw.resolve()
+    else:
+        path = (scripts_dir / raw).resolve()
+
+    try:
+        path.relative_to(scripts_dir_resolved)
+    except ValueError:
+        return None, (
+            f"Blocked: script path resolves outside the scripts directory "
+            f"({scripts_dir_resolved}): {script_path!r}"
+        )
+
+    if not path.exists():
+        return None, f"Script not found: {path}"
+    if not path.is_file():
+        return None, f"Script path is not a file: {path}"
+    return path, None
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -3971,51 +4004,9 @@ def _run_job_script(
         (success, output) — on failure *output* contains the error message so the
         LLM can report the problem to the user.
     """
-    scripts_dir = _get_hermes_home() / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    scripts_dir_resolved = scripts_dir.resolve()
-
-    # Same ingestion contract as cron.lifecycle_guard._expand_candidate_path:
-    # a NUL-bearing value can never name a real script, and on Windows the
-    # Path operations raise ValueError *after* expanduser (expanduser never
-    # expands "~user" there, so the try below never fires) — reject eagerly
-    # so both platforms fail cleanly instead of crashing the scheduler.
-    # str() first so the guard itself can never raise TypeError on a
-    # non-str script_path (e.g. a Path passed by a future caller) — the
-    # guard must be crash-proof even though every current call site
-    # passes a plain str (#86832 review).
-    if "\x00" in str(script_path):
-        return False, f"Blocked: script path contains a NUL byte: {script_path!r}"
-
-    try:
-        raw = Path(script_path).expanduser()
-    except (ValueError, RuntimeError, OSError):
-        # Same ingestion contract as cron.lifecycle_guard: a NUL-bearing
-        # value (ValueError) or an unexpandable ``~`` (RuntimeError with no
-        # resolvable HOME) can never name a real script. The creation-time
-        # guard tolerates such values as "nothing to scan", so they can
-        # reach fire time — fail the run with a report instead of crashing
-        # the scheduler with an unhandled exception.
-        return False, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
-    if raw.is_absolute():
-        path = raw.resolve()
-    else:
-        path = (scripts_dir / raw).resolve()
-
-    # Guard against path traversal, absolute path injection, and symlink
-    # escape — scripts MUST reside within HERMES_HOME/scripts/.
-    try:
-        path.relative_to(scripts_dir_resolved)
-    except ValueError:
-        return False, (
-            f"Blocked: script path resolves outside the scripts directory "
-            f"({scripts_dir_resolved}): {script_path!r}"
-        )
-
-    if not path.exists():
-        return False, f"Script not found: {path}"
-    if not path.is_file():
-        return False, f"Script path is not a file: {path}"
+    path, path_error = _resolve_job_script_path(script_path)
+    if path_error is not None or path is None:
+        return False, path_error or "Blocked: script path could not be resolved"
 
     script_timeout = _get_script_timeout()
 
@@ -4098,11 +4089,14 @@ def _run_job_script(
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()
 
-        # Redact secrets from both stdout and stderr before any return path.
+        # Redact ordinary secrets and the exact managed principal before any
+        # return path can persist or deliver worker-controlled output.
         try:
             from agent.redact import redact_sensitive_text
-            stdout = redact_sensitive_text(stdout)
-            stderr = redact_sensitive_text(stderr)
+            from tools.environments.local import redact_managed_execution_values
+
+            stdout = redact_managed_execution_values(redact_sensitive_text(stdout))
+            stderr = redact_managed_execution_values(redact_sensitive_text(stderr))
         except Exception as e:
             logger.warning("Failed to redact sensitive text from output: %s", e)
             stdout = "[REDACTED - redaction failed]"
@@ -5210,6 +5204,29 @@ def run_job(
         # jobs remain different: their script runs above the managed bind as a
         # wake gate and never sees the principal.
         if _managed_context is not None:
+            # Binding means a worker is authorized to start. Complete every
+            # deterministic script precondition first so a missing/blocked
+            # path cannot create phantom durable worker evidence.
+            _resolved_script, _script_preflight_error = _resolve_job_script_path(
+                script_path
+            )
+            if _script_preflight_error is not None or _resolved_script is None:
+                _preflight_output = _script_preflight_error or (
+                    "Blocked: script path could not be resolved"
+                )
+                _preflight_now = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+                _preflight_alert = (
+                    f"⚠ Cron watchdog '{job_name}' script failed\n\n"
+                    f"{_preflight_output}\n\nTime: {_preflight_now}"
+                )
+                _preflight_doc = (
+                    f"# Cron Job: {job_name}\n\n"
+                    f"**Job ID:** {job_id}\n"
+                    f"**Run Time:** {_preflight_now}\n"
+                    f"**Mode:** no_agent (script)\n"
+                    f"**Status:** script failed\n\n{_preflight_output}\n"
+                )
+                return False, _preflight_doc, _preflight_alert, _preflight_output
             _managed_execution_id = job.get("execution_id")
             if not isinstance(_managed_execution_id, str) or not _managed_execution_id:
                 return _refuse_managed_dispatch(

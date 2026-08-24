@@ -103,6 +103,16 @@ def _write_no_agent_worker(home: Path) -> str:
     return "no_agent_worker.py"
 
 
+def _write_no_agent_leaky_worker(home: Path) -> str:
+    script = home / "scripts" / "no_agent_leaky_worker.py"
+    script.write_text(
+        "import os\n"
+        f"print(os.environ[{CAP_ENV!r}])\n",
+        encoding="utf-8",
+    )
+    return "no_agent_leaky_worker.py"
+
+
 class _RunJobStubs:
     """Patch run_job's provider/config seams so it runs without credentials.
 
@@ -336,6 +346,39 @@ def test_managed_no_agent_binding_refusal_never_starts_script(
     assert row["worker_started_at"] is None
     assert row["capability_sha256"] is None
     assert "could not be durably bound" in (row["error"] or "")
+
+
+def test_managed_no_agent_output_cannot_persist_or_deliver_raw_capability(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = "managed-capability-must-never-leave-worker"
+    monkeypatch.setattr(scheduler.secrets, "token_urlsafe", lambda _n: raw)
+    stubs = _RunJobStubs(monkeypatch, tmp_path)
+    job = _managed_job(_write_no_agent_leaky_worker(home), no_agent=True)
+
+    assert scheduler.run_one_job(job) is True
+
+    row = executions.list_executions(job_id="managed-job")[0]
+    assert row["capability_sha256"] == hashlib.sha256(raw.encode()).hexdigest()
+    assert stubs.observed["docs"]
+    assert raw not in "\n".join(stubs.observed["docs"])
+    assert not any(raw in str(run) for run in stubs.observed.get("runs", []))
+
+
+def test_managed_no_agent_missing_script_creates_no_worker_evidence(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _managed_job("missing-no-agent-worker.py", no_agent=True)
+
+    assert scheduler.run_one_job(job) is True
+
+    row = executions.list_executions(job_id="managed-job")[0]
+    assert row["status"] == "failed"
+    assert row["worker_started_at"] is None
+    assert row["lane_id"] is None
+    assert row["session_sha256"] is None
+    assert row["capability_sha256"] is None
+    assert "not found" in (row["error"] or "").lower()
 
 
 # ---------------------------------------------------------------------------
