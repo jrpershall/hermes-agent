@@ -5483,66 +5483,6 @@ def run_job(
         return True, "", SILENT_MARKER, None
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
-    # ---------------------------------------------------------------
-    # Managed execution: bind the worker to its scheduler-owned execution
-    # row NOW — after the script gate said wakeAgent=true and the prompt is
-    # built, before the agent is constructed. The row was created and marked
-    # running by the dispatcher (run_one_job / tick), so the execution ID the
-    # worker receives is the same one the ledger recorded before dispatch.
-    # Only digests are persisted; the raw capability lives in a ContextVar
-    # that every child-process env built under this run inherits (terminal
-    # tool, ACP/codex/claude executors) and is dropped in ``finally``.
-    # A gate that returned wakeAgent=false already returned above, so an
-    # idle tick never acquires worker evidence.
-    # ---------------------------------------------------------------
-    if _managed_context is not None:
-        _managed_execution_id = job.get("execution_id")
-        if not isinstance(_managed_execution_id, str) or not _managed_execution_id:
-            return _refuse_managed_dispatch(
-                job_id,
-                job_name,
-                "managed execution requires a scheduler-created execution row; "
-                "refusing to dispatch the worker without one",
-            )
-        _managed_capability = secrets.token_urlsafe(48)
-        _managed_session_sha256 = hashlib.sha256(
-            f"{_managed_execution_id}:{_cron_session_id}".encode("utf-8")
-        ).hexdigest()
-        try:
-            _managed_bound = bind_managed_worker(
-                _managed_execution_id,
-                job_id=job_id,
-                lane_id=_managed_context["lane_id"],
-                session_sha256=_managed_session_sha256,
-                capability_sha256=capability_digest(_managed_capability),
-            )
-        except Exception as exc:
-            logger.error(
-                "Job '%s': managed execution binding write failed (%s)",
-                job_id, type(exc).__name__, exc_info=True,
-            )
-            _managed_bound = None
-        if _managed_bound is None:
-            return _refuse_managed_dispatch(
-                job_id,
-                job_name,
-                f"managed execution {_managed_execution_id} could not be durably "
-                f"bound to lane {_managed_context['lane_id']!r} (row missing, not "
-                "running, already bound, or ledger write failed); agent NOT run",
-            )
-        from tools.environments.local import bind_managed_execution_env
-
-        _managed_env_token = bind_managed_execution_env(
-            {
-                _managed_context["execution_id_env"]: _managed_execution_id,
-                _managed_context["execution_capability_env"]: _managed_capability,
-            }
-        )
-        del _managed_capability
-        logger.info(
-            "Job '%s': managed worker bound to execution %s on lane %s",
-            job_id, _managed_execution_id, _managed_context["lane_id"],
-        )
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -5659,6 +5599,71 @@ def run_job(
     _cron_session_token = None
     _non_dispatcher_token = None
     try:
+        # ---------------------------------------------------------------
+        # Managed execution: bind the worker to its scheduler-owned execution
+        # row NOW — after the script gate said wakeAgent=true and the prompt is
+        # built, before the agent is constructed. The row was created and marked
+        # running by the dispatcher (run_one_job / tick), so the execution ID the
+        # worker receives is the same one the ledger recorded before dispatch.
+        # Only digests are persisted; the raw capability lives in a ContextVar
+        # that every child-process env built under this run inherits (terminal
+        # tool, ACP/codex/claude executors) and is dropped in ``finally``.
+        # A gate that returned wakeAgent=false already returned above, so an
+        # idle tick never acquires worker evidence.
+        # This block lives INSIDE the try whose ``finally`` resets the binding:
+        # a raise anywhere after the bind (lock timeout, config load, agent
+        # construction) must release the raw capability on the way out — the
+        # direct ``cronjob(action='run')`` path does not run under a copied
+        # context, so a leaked ContextVar there would outlive the run.
+        # ---------------------------------------------------------------
+        if _managed_context is not None:
+            _managed_execution_id = job.get("execution_id")
+            if not isinstance(_managed_execution_id, str) or not _managed_execution_id:
+                return _refuse_managed_dispatch(
+                    job_id,
+                    job_name,
+                    "managed execution requires a scheduler-created execution row; "
+                    "refusing to dispatch the worker without one",
+                )
+            _managed_capability = secrets.token_urlsafe(48)
+            _managed_session_sha256 = hashlib.sha256(
+                f"{_managed_execution_id}:{_cron_session_id}".encode("utf-8")
+            ).hexdigest()
+            try:
+                _managed_bound = bind_managed_worker(
+                    _managed_execution_id,
+                    job_id=job_id,
+                    lane_id=_managed_context["lane_id"],
+                    session_sha256=_managed_session_sha256,
+                    capability_sha256=capability_digest(_managed_capability),
+                )
+            except Exception as exc:
+                logger.error(
+                    "Job '%s': managed execution binding write failed (%s)",
+                    job_id, type(exc).__name__, exc_info=True,
+                )
+                _managed_bound = None
+            if _managed_bound is None:
+                return _refuse_managed_dispatch(
+                    job_id,
+                    job_name,
+                    f"managed execution {_managed_execution_id} could not be durably "
+                    f"bound to lane {_managed_context['lane_id']!r} (row missing, not "
+                    "running, already bound, or ledger write failed); agent NOT run",
+                )
+            from tools.environments.local import bind_managed_execution_env
+
+            _managed_env_token = bind_managed_execution_env(
+                {
+                    _managed_context["execution_id_env"]: _managed_execution_id,
+                    _managed_context["execution_capability_env"]: _managed_capability,
+                }
+            )
+            del _managed_capability
+            logger.info(
+                "Job '%s': managed worker bound to execution %s on lane %s",
+                job_id, _managed_execution_id, _managed_context["lane_id"],
+            )
         if not _cwd_lock_acquired:
             # Fail closed (#79768): running without the lock would let a
             # concurrent workdir job's process-global TERMINAL_CWD override

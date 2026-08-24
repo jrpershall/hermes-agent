@@ -38,6 +38,11 @@ _MANAGED_EXECUTION_DEFAULT_ENV_NAMES = (
     "HERMES_MANAGED_EXECUTION_ID",
     "HERMES_MANAGED_EXECUTION_CAPABILITY",
 )
+# Every env name that has ever carried a principal in this process (the
+# defaults plus any operator-configured names seen at bind time). Stripped
+# from every child env while no binding is active, so a stale inherited copy
+# under a custom name can never masquerade as a live principal.
+_MANAGED_EXECUTION_KNOWN_ENV_NAMES: set[str] = set(_MANAGED_EXECUTION_DEFAULT_ENV_NAMES)
 
 
 def bind_managed_execution_env(
@@ -47,6 +52,7 @@ def bind_managed_execution_env(
     items = tuple((str(name), str(value)) for name, value in dict(bindings).items())
     if not items or any(not name or not value for name, value in items):
         raise ValueError("managed execution env bindings must be non-empty name/value pairs")
+    _MANAGED_EXECUTION_KNOWN_ENV_NAMES.update(name for name, _value in items)
     return _MANAGED_EXECUTION_ENV.set(items)
 
 
@@ -57,9 +63,7 @@ def reset_managed_execution_env(token: Token[tuple[tuple[str, str], ...] | None]
 def _inject_managed_execution_env(env: dict[str, str]) -> None:
     """Apply the bound principal to a child env; strip any inherited copy first."""
     binding = _MANAGED_EXECUTION_ENV.get()
-    for name in _MANAGED_EXECUTION_DEFAULT_ENV_NAMES:
-        env.pop(name, None)
-    for name, _value in binding or ():
+    for name in _MANAGED_EXECUTION_KNOWN_ENV_NAMES:
         env.pop(name, None)
     if binding is None:
         return
@@ -68,9 +72,18 @@ def _inject_managed_execution_env(env: dict[str, str]) -> None:
 
         delegated = is_delegated_child_process_context()
     except Exception:
-        # Cannot prove this is the top-level worker: withhold the principal.
+        # Cannot prove this is the top-level worker: withhold the principal —
+        # loudly, so the downstream "evidence is missing" is traceable here.
+        logger.warning(
+            "managed execution principal withheld from child env: "
+            "delegation context could not be resolved",
+            exc_info=True,
+        )
         return
     if delegated:
+        logger.debug(
+            "managed execution principal withheld from delegated child env"
+        )
         return
     for name, value in binding:
         env[name] = value

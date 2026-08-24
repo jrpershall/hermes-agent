@@ -478,11 +478,15 @@ _MANAGED_PROTECTED_ENV_NAMES = frozenset(
         "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "TMPDIR", "TMP", "TEMP",
         "LANG", "LC_ALL", "TERM", "TERMINAL_CWD", "VIRTUAL_ENV", "NODE_PATH",
         "HERMES_HOME", "HERMES_MODEL", "HERMES_SESSION_KEY", "HERMES_KANBAN_TASK",
+        # Interpreter / shell / VCS startup hooks — a value injected here would
+        # be executed or sourced by the child, not merely read.
+        "BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "NODE_OPTIONS",
+        "PERL5OPT", "RUBYOPT", "CODEX_HOME",
     }
 )
 _MANAGED_PROTECTED_ENV_PREFIXES = (
     "LD_", "DYLD_", "PYTHON", "HERMES_CRON_", "HERMES_SESSION", "HERMES_KANBAN",
-    "HERMES_DELEGAT", "GATEWAY_", "AUXILIARY_",
+    "HERMES_DELEGAT", "GATEWAY_", "AUXILIARY_", "GIT_", "SSH_",
 )
 
 

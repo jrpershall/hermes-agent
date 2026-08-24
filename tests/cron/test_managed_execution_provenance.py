@@ -295,6 +295,9 @@ MALFORMED = {
         "execution_capability_env": "DYLD_INSERT_LIBRARIES",
     },
     "protected-LD-prefix": {**CONTEXT, "execution_capability_env": "LD_PRELOAD"},
+    "protected-BASH_ENV": {**CONTEXT, "execution_capability_env": "BASH_ENV"},
+    "protected-NODE_OPTIONS": {**CONTEXT, "execution_id_env": "NODE_OPTIONS"},
+    "protected-GIT-prefix": {**CONTEXT, "execution_capability_env": "GIT_SSH_COMMAND"},
     "invalid-identifier": {**CONTEXT, "execution_id_env": "has-dash"},
     "lowercase-identifier": {**CONTEXT, "execution_id_env": "hermes_managed"},
     "not-an-object": "repair-3",
@@ -420,6 +423,75 @@ def test_binding_write_failure_blocks_dispatch(
     blob = rows[0]["error"] + caplog.text + "\n".join(stubs.observed.get("docs", []))
     assert not TOKEN_LIKE_RE.search(blob.replace(rows[0]["id"], ""))
     assert ID_ENV not in local.build_subprocess_env({})
+
+
+@pytest.mark.parametrize(
+    "raise_at",
+    ["session_vars", "cwd_lock_timeout", "delivery_target", "agent_init", "agent_run"],
+)
+def test_exception_after_bind_releases_the_principal(
+    raise_at: str, home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any raise after the bind must release the raw capability on the way out.
+
+    ``run_one_job`` is driven DIRECTLY here — the ``cronjob(action='run')``
+    path, which does not run under a copied context — so a binding that
+    survived the run would persist in the caller's context for every later
+    child process. Failure points are chosen across the whole post-bind
+    window: config resolution, agent construction, and the model turn.
+    """
+    stubs = _RunJobStubs(monkeypatch, tmp_path)
+    job = _managed_job(_write_gate(home, wake=True))
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("post-bind failure")
+
+    if raise_at == "session_vars":
+        # Raised in the pre-``try`` window of run_job (the original leak).
+        from gateway import session_context
+
+        monkeypatch.setattr(session_context, "set_session_vars", _boom)
+    elif raise_at == "cwd_lock_timeout":
+        monkeypatch.setattr(scheduler, "_cwd_lock_timeout_seconds", _boom)
+    elif raise_at == "delivery_target":
+        monkeypatch.setattr(scheduler, "_resolve_delivery_target", _boom)
+    else:
+        import run_agent as fake_mod
+
+        real = fake_mod.AIAgent
+
+        class Exploding(real):
+            def __init__(self, **kwargs):
+                if raise_at == "agent_init":
+                    _boom()
+                super().__init__(**kwargs)
+
+            def run_conversation(self, *a, **kw):
+                _boom()
+
+        fake_mod.AIAgent = Exploding
+
+    # A raise inside run_job's own try/except is absorbed (True); a raise
+    # before it propagates to run_one_job's outer handler (False). Either
+    # way the binding must be gone and the ledger row terminal.
+    assert scheduler.run_one_job(job) in (True, False)
+
+    # The principal did not outlive the run — on either spawn surface.
+    assert ID_ENV not in local.build_subprocess_env({})
+    assert CAP_ENV not in local.build_subprocess_env({})
+    assert ID_ENV not in local.hermes_subprocess_env()
+    assert local._MANAGED_EXECUTION_ENV.get() is None
+    (row,) = executions.list_executions(job_id="managed-job")
+    assert row["status"] == "failed"
+    if raise_at in {"delivery_target", "agent_init", "agent_run"}:
+        assert row["worker_started_at"]  # bound before the failure, retained
+    else:
+        # Raised before the bind: no worker evidence may exist.
+        assert row["worker_started_at"] is None and row["capability_sha256"] is None
+    assert not any(
+        TOKEN_LIKE_RE.search(str(r).replace(row["id"], ""))
+        for r in stubs.observed.get("runs", [])
+    )
 
 
 def test_managed_run_job_without_scheduler_execution_row_fails_closed(
@@ -703,6 +775,19 @@ def test_principal_reaches_codex_app_server_spawn(
     client._closed = True
     assert ID_ENV not in captured["env"]
     assert CAP_ENV not in captured["env"]
+
+
+def test_custom_env_names_are_stripped_when_unbound() -> None:
+    """A stale inherited copy under operator-configured names is stripped too."""
+    custom_id, custom_cap = "FIXER_EXECUTION_ID", "FIXER_EXECUTION_CAPABILITY"
+    token = local.bind_managed_execution_env({custom_id: "exec-c", custom_cap: "raw-c"})
+    try:
+        assert local.build_subprocess_env({})[custom_cap] == "raw-c"
+    finally:
+        local.reset_managed_execution_env(token)
+    stale = {custom_id: "stale-id", custom_cap: "stale-cap"}
+    assert custom_id not in local.build_subprocess_env(stale)
+    assert custom_cap not in local.build_subprocess_env(stale)
 
 
 def test_env_binding_is_context_local_and_scrubbed_for_delegated_children() -> None:
