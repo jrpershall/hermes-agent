@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping
+from contextvars import ContextVar, Token
 from pathlib import Path
 
 from hermes_constants import get_process_hermes_home
@@ -21,6 +22,58 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 _IS_WINDOWS = platform.system() == "Windows"
 
 logger = logging.getLogger(__name__)
+
+# Scheduler-owned managed-execution principal (cron ``managed_execution_context``).
+# The cron scheduler binds ``{env_name: value}`` pairs — the execution ID and
+# the RAW per-execution capability under the job's configured names — to the
+# worker's context right before model dispatch, and every child-process env
+# built in that context carries them. A ContextVar (not ``os.environ``) so
+# parallel cron jobs never see each other's capability and nothing survives
+# the run. Delegated child contexts are scrubbed: the principal belongs to the
+# top-level worker only.
+_MANAGED_EXECUTION_ENV: ContextVar[tuple[tuple[str, str], ...] | None] = ContextVar(
+    "hermes_managed_execution_env", default=None
+)
+_MANAGED_EXECUTION_DEFAULT_ENV_NAMES = (
+    "HERMES_MANAGED_EXECUTION_ID",
+    "HERMES_MANAGED_EXECUTION_CAPABILITY",
+)
+
+
+def bind_managed_execution_env(
+    bindings: "Mapping[str, str]",
+) -> Token[tuple[tuple[str, str], ...] | None]:
+    """Bind managed-execution env pairs to the current context; returns a reset token."""
+    items = tuple((str(name), str(value)) for name, value in dict(bindings).items())
+    if not items or any(not name or not value for name, value in items):
+        raise ValueError("managed execution env bindings must be non-empty name/value pairs")
+    return _MANAGED_EXECUTION_ENV.set(items)
+
+
+def reset_managed_execution_env(token: Token[tuple[tuple[str, str], ...] | None]) -> None:
+    _MANAGED_EXECUTION_ENV.reset(token)
+
+
+def _inject_managed_execution_env(env: dict[str, str]) -> None:
+    """Apply the bound principal to a child env; strip any inherited copy first."""
+    binding = _MANAGED_EXECUTION_ENV.get()
+    for name in _MANAGED_EXECUTION_DEFAULT_ENV_NAMES:
+        env.pop(name, None)
+    for name, _value in binding or ():
+        env.pop(name, None)
+    if binding is None:
+        return
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        delegated = is_delegated_child_process_context()
+    except Exception:
+        # Cannot prove this is the top-level worker: withhold the principal.
+        return
+    if delegated:
+        return
+    for name, value in binding:
+        env[name] = value
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -534,6 +587,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     _apply_windows_msys_bash_env_defaults(sanitized)
 
     sanitized = _scrub_delegated_child_kanban_env(sanitized)
+    _inject_managed_execution_env(sanitized)
 
     return sanitized
 
@@ -675,6 +729,10 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # context that later imports Kanban DB code in the spawned process would
     # still see the parent's HERMES_HOME but lose the DB mutation guard.
     env = _scrub_delegated_child_kanban_env(env)
+
+    # Model-driving CLI executors (ACP / codex app-server / claude) ARE the
+    # worker process for a managed cron job — the principal must reach them.
+    _inject_managed_execution_env(env)
 
     return env
 
@@ -1346,6 +1404,7 @@ def _make_run_env(env: dict) -> dict:
     _apply_windows_msys_bash_env_defaults(run_env)
 
     run_env = _scrub_delegated_child_kanban_env(run_env)
+    _inject_managed_execution_env(run_env)
 
     return run_env
 

@@ -14,10 +14,12 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -546,7 +548,13 @@ from cron.jobs import (
     save_job_output,
     use_cron_store,
 )
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    bind_managed_worker,
+    capability_digest,
+    create_execution,
+    finish_execution,
+    mark_execution_running,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -4616,6 +4624,41 @@ def _block_and_pause_job(
     return False, doc, alert, reason
 
 
+def _managed_execution_context(job: dict) -> Optional[dict]:
+    """Validated ``managed_execution_context`` for this job, or ``None``.
+
+    Raises ``ValueError`` for a malformed declaration (hand-edited jobs.json
+    records bypass the create/update validation) so the caller can refuse to
+    dispatch before any model worker starts.
+    """
+    if job.get("managed_execution_context") is None:
+        return None
+    from cron.jobs import validate_managed_execution_context
+
+    return validate_managed_execution_context(job["managed_execution_context"])
+
+
+def _refuse_managed_dispatch(
+    job_id: str, job_name: str, reason: str
+) -> tuple[bool, str, str, Optional[str]]:
+    """Fail a managed run closed before the provider is ever called.
+
+    Unlike ``_block_and_pause_job`` this does NOT pause the job: a ledger
+    write failure is transient and the next tick may bind cleanly. ``reason``
+    is operator-facing and must never carry the raw capability.
+    """
+    logger.error("Job '%s': %s", job_id, reason)
+    now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+    doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {now_iso}\n"
+        f"**Status:** blocked (managed execution not bound) — agent NOT run\n\n"
+        f"{reason}\n"
+    )
+    return False, doc, "", reason
+
+
 # Marker prefix stamped into the error string returned by ``run_job`` when the
 # pre-dispatch configuration validation (T1-26) refuses to run the agent.
 # ``run_one_job`` keys off it to record ``last_status='blocked_config'`` and to
@@ -5090,6 +5133,17 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    # Managed-execution declaration is validated before ANY path (script,
+    # no_agent, or agent) runs. A malformed declaration is an unrunnable job
+    # shape: pause it so it cannot re-fire every tick with no principal.
+    try:
+        _managed_context = _managed_execution_context(job)
+    except ValueError as exc:
+        return _block_and_pause_job(
+            job_id, job_name, f"managed_execution_context is invalid: {exc}"
+        )
+    _managed_env_token = None
+
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
     # ---------------------------------------------------------------
@@ -5428,6 +5482,67 @@ def run_job(
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+
+    # ---------------------------------------------------------------
+    # Managed execution: bind the worker to its scheduler-owned execution
+    # row NOW — after the script gate said wakeAgent=true and the prompt is
+    # built, before the agent is constructed. The row was created and marked
+    # running by the dispatcher (run_one_job / tick), so the execution ID the
+    # worker receives is the same one the ledger recorded before dispatch.
+    # Only digests are persisted; the raw capability lives in a ContextVar
+    # that every child-process env built under this run inherits (terminal
+    # tool, ACP/codex/claude executors) and is dropped in ``finally``.
+    # A gate that returned wakeAgent=false already returned above, so an
+    # idle tick never acquires worker evidence.
+    # ---------------------------------------------------------------
+    if _managed_context is not None:
+        _managed_execution_id = job.get("execution_id")
+        if not isinstance(_managed_execution_id, str) or not _managed_execution_id:
+            return _refuse_managed_dispatch(
+                job_id,
+                job_name,
+                "managed execution requires a scheduler-created execution row; "
+                "refusing to dispatch the worker without one",
+            )
+        _managed_capability = secrets.token_urlsafe(48)
+        _managed_session_sha256 = hashlib.sha256(
+            f"{_managed_execution_id}:{_cron_session_id}".encode("utf-8")
+        ).hexdigest()
+        try:
+            _managed_bound = bind_managed_worker(
+                _managed_execution_id,
+                job_id=job_id,
+                lane_id=_managed_context["lane_id"],
+                session_sha256=_managed_session_sha256,
+                capability_sha256=capability_digest(_managed_capability),
+            )
+        except Exception as exc:
+            logger.error(
+                "Job '%s': managed execution binding write failed (%s)",
+                job_id, type(exc).__name__, exc_info=True,
+            )
+            _managed_bound = None
+        if _managed_bound is None:
+            return _refuse_managed_dispatch(
+                job_id,
+                job_name,
+                f"managed execution {_managed_execution_id} could not be durably "
+                f"bound to lane {_managed_context['lane_id']!r} (row missing, not "
+                "running, already bound, or ledger write failed); agent NOT run",
+            )
+        from tools.environments.local import bind_managed_execution_env
+
+        _managed_env_token = bind_managed_execution_env(
+            {
+                _managed_context["execution_id_env"]: _managed_execution_id,
+                _managed_context["execution_capability_env"]: _managed_capability,
+            }
+        )
+        del _managed_capability
+        logger.info(
+            "Job '%s': managed worker bound to execution %s on lane %s",
+            job_id, _managed_execution_id, _managed_context["lane_id"],
+        )
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -6396,6 +6511,13 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        # Drop the managed-execution principal first: nothing that runs after
+        # the agent (delivery, teardown) may spawn a child carrying it.
+        if _managed_env_token is not None:
+            from tools.environments.local import reset_managed_execution_env
+
+            reset_managed_execution_env(_managed_env_token)
+            _managed_env_token = None
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
         # only ever mutate it when the job has a workdir AND actually held
         # the write lock — a fail-closed timeout raised before the env-set,
@@ -6753,6 +6875,10 @@ def _run_one_job_body(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+        # Hand the row identity to run_job exactly as the ticker does
+        # (``dispatched_job = dict(job, execution_id=...)``): a managed job
+        # binds its worker to THIS row and refuses to dispatch without it.
+        job = dict(job, execution_id=execution_id)
     delivery_attempted = False
     delivery_error = None
     try:

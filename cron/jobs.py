@@ -459,6 +459,91 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
 # into output writes/deletes.
 _IMMUTABLE_JOB_FIELDS = frozenset({"id"})
 
+# ``managed_execution_context`` — opt-in declaration that a job's model worker
+# must run under a scheduler-owned execution principal (see
+# ``cron.executions.bind_managed_worker``). The scheduler binds the worker to
+# exactly one execution row and hands the worker its execution ID and a raw
+# per-execution capability under these two environment-variable names. The
+# names are operator-configured but validated here so a job record can never
+# name a protected variable (``PATH``, ``HOME``, loader hooks, Hermes-internal
+# session/profile plumbing) or the same variable twice. Jobs that do not
+# declare the field are untouched — the key is only ever written when set.
+MANAGED_EXECUTION_CONTEXT_FIELDS = frozenset(
+    {"lane_id", "execution_id_env", "execution_capability_env"}
+)
+_MANAGED_LANE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_MANAGED_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+_MANAGED_PROTECTED_ENV_NAMES = frozenset(
+    {
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "TMPDIR", "TMP", "TEMP",
+        "LANG", "LC_ALL", "TERM", "TERMINAL_CWD", "VIRTUAL_ENV", "NODE_PATH",
+        "HERMES_HOME", "HERMES_MODEL", "HERMES_SESSION_KEY", "HERMES_KANBAN_TASK",
+    }
+)
+_MANAGED_PROTECTED_ENV_PREFIXES = (
+    "LD_", "DYLD_", "PYTHON", "HERMES_CRON_", "HERMES_SESSION", "HERMES_KANBAN",
+    "HERMES_DELEGAT", "GATEWAY_", "AUXILIARY_",
+)
+
+
+def validate_managed_execution_context(value: Any) -> Optional[Dict[str, str]]:
+    """Validate a job's ``managed_execution_context``; ``None`` means undeclared.
+
+    Returns a normalized copy containing exactly the three contract fields, or
+    raises ``ValueError`` with a precise, non-secret reason. Enforced at the
+    store boundary (create/update) and again by the scheduler at dispatch so a
+    hand-edited jobs.json record fails closed before any model worker starts.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("managed_execution_context must be an object")
+    keys = set(value)
+    missing = MANAGED_EXECUTION_CONTEXT_FIELDS - keys
+    if missing:
+        raise ValueError(
+            "managed_execution_context is missing required field(s): "
+            + ", ".join(sorted(missing))
+        )
+    unknown = keys - MANAGED_EXECUTION_CONTEXT_FIELDS
+    if unknown:
+        raise ValueError(
+            "managed_execution_context has unknown field(s): "
+            + ", ".join(sorted(str(k) for k in unknown))
+        )
+    for field in sorted(MANAGED_EXECUTION_CONTEXT_FIELDS):
+        if not isinstance(value[field], str) or not value[field]:
+            raise ValueError(f"managed_execution_context.{field} must be a non-empty string")
+    lane_id = value["lane_id"]
+    if not _MANAGED_LANE_ID_RE.match(lane_id):
+        raise ValueError(
+            "managed_execution_context.lane_id must be 1-128 characters of "
+            "letters, digits, '.', '_' or '-' (starting with a letter or digit)"
+        )
+    for field in ("execution_id_env", "execution_capability_env"):
+        name = value[field]
+        if not _MANAGED_ENV_NAME_RE.match(name):
+            raise ValueError(
+                f"managed_execution_context.{field} must be an upper-case "
+                "environment variable name ([A-Z][A-Z0-9_]*, max 128 chars)"
+            )
+        if name in _MANAGED_PROTECTED_ENV_NAMES or name.startswith(
+            _MANAGED_PROTECTED_ENV_PREFIXES
+        ):
+            raise ValueError(
+                f"managed_execution_context.{field} names a protected environment variable"
+            )
+    if value["execution_id_env"] == value["execution_capability_env"]:
+        raise ValueError(
+            "managed_execution_context.execution_id_env and "
+            "execution_capability_env must be distinct"
+        )
+    return {
+        "lane_id": lane_id,
+        "execution_id_env": value["execution_id_env"],
+        "execution_capability_env": value["execution_capability_env"],
+    }
+
 
 def _job_output_dir(job_id: str) -> Path:
     """Resolve a job's output directory, rejecting any path-escape attempt.
@@ -1933,6 +2018,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    managed_execution_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2027,6 +2113,11 @@ def create_job(
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
+    # Validate the managed-execution declaration before anything is written:
+    # a malformed declaration must never reach the store (or the scheduler).
+    normalized_managed_context = validate_managed_execution_context(
+        managed_execution_context
+    )
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
@@ -2149,6 +2240,10 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    # Same conditional-persist rule: undeclared jobs never gain the key, so
+    # their stored shape (and scheduler behavior) is byte-for-byte unchanged.
+    if normalized_managed_context is not None:
+        job["managed_execution_context"] = normalized_managed_context
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2246,6 +2341,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            # Managed-execution declaration: validated exactly as create_job
+            # does. ``None`` clears it; anything else must be the full,
+            # well-formed contract or the update is refused before the merge.
+            if "managed_execution_context" in updates:
+                updates["managed_execution_context"] = validate_managed_execution_context(
+                    updates["managed_execution_context"]
+                )
 
             # Normalize monitor fields the same way create_job does (empty
             # string clears the field).

@@ -7,7 +7,9 @@ proved gone. Terminal states are immutable.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import sqlite3
 import threading
 import uuid
@@ -25,6 +27,26 @@ MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+
+# Scheduler-owned worker provenance for jobs that declare a
+# ``managed_execution_context`` (see ``cron.jobs.validate_managed_execution_context``).
+# Every column is nullable and stays NULL for ordinary jobs, so the ledger
+# shape for undeclared jobs is unchanged. Only SHA-256 digests are stored:
+# the raw execution capability is delivered to the worker through its
+# environment and never enters SQLite, logs, or output.
+MANAGED_EXECUTION_COLUMNS = (
+    "worker_started_at",
+    "lane_id",
+    "session_sha256",
+    "capability_sha256",
+)
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+_MAX_LANE_ID_LENGTH = 128
+
+
+def capability_digest(capability: str) -> str:
+    """Digest under which a raw execution capability is persisted."""
+    return hashlib.sha256(str(capability).encode("utf-8")).hexdigest()
 
 
 def _connect() -> sqlite3.Connection:
@@ -64,6 +86,31 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
     )
+    _migrate_managed_execution_columns(conn)
+
+
+def _existing_columns(conn: sqlite3.Connection) -> set[str]:
+    return {str(row[1]) for row in conn.execute("PRAGMA table_info(executions)").fetchall()}
+
+
+def _migrate_managed_execution_columns(conn: sqlite3.Connection) -> None:
+    """Forward-only, idempotent: add any missing managed column as nullable TEXT.
+
+    A ledger written before these columns existed gains them on first open;
+    a ledger that already carries them (in any column order) is untouched.
+    Two processes migrating the same file concurrently can both observe the
+    column as missing — the loser's ``ALTER`` raises ``duplicate column``,
+    which is re-checked rather than treated as a failure.
+    """
+    existing = _existing_columns(conn)
+    for column in MANAGED_EXECUTION_COLUMNS:
+        if column in existing:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE executions ADD COLUMN {column} TEXT")
+        except sqlite3.OperationalError:
+            if column not in _existing_columns(conn):
+                raise
 
 
 @contextmanager
@@ -166,6 +213,62 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
             """UPDATE executions SET status='running', started_at=?
                WHERE id=? AND status='claimed'""",
             (now, execution_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
+    _emit_execution_state(record)
+    return record
+
+
+def bind_managed_worker(
+    execution_id: str,
+    *,
+    job_id: str,
+    lane_id: str,
+    session_sha256: str,
+    capability_sha256: str,
+) -> Optional[Dict[str, Any]]:
+    """Bind worker provenance to one running, still-unbound execution row.
+
+    Writes the configured lane, ``worker_started_at``, and the session and
+    capability digests in a single fenced ``UPDATE``: the row must be the
+    exact ``execution_id`` for ``job_id``, currently ``running``, and carry no
+    managed evidence yet. Anything else returns ``None`` so the caller fails
+    closed before a model worker starts. Terminalization
+    (:func:`finish_execution`) and interrupted-execution recovery only touch
+    status/finish fields, so a binding written here survives them verbatim.
+    """
+    if not isinstance(lane_id, str) or not lane_id or len(lane_id) > _MAX_LANE_ID_LENGTH:
+        raise ValueError("managed execution lane_id is invalid")
+    for label, digest in (
+        ("session_sha256", session_sha256),
+        ("capability_sha256", capability_sha256),
+    ):
+        if not isinstance(digest, str) or not _SHA256_HEX_RE.match(digest):
+            raise ValueError(f"managed execution {label} must be a lowercase SHA-256 hex digest")
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        current = conn.execute(
+            "SELECT started_at FROM executions WHERE id=? AND job_id=? AND status='running'",
+            (execution_id, str(job_id)),
+        ).fetchone()
+        if current is None:
+            return None
+        # Same clock as ``started_at``; never let the worker start read as
+        # earlier than the run it belongs to.
+        started_at = current["started_at"]
+        worker_started_at = max(now, started_at) if isinstance(started_at, str) else now
+        cur = conn.execute(
+            """UPDATE executions
+               SET worker_started_at=?, lane_id=?, session_sha256=?, capability_sha256=?
+               WHERE id=? AND job_id=? AND status='running'
+                 AND worker_started_at IS NULL AND lane_id IS NULL
+                 AND session_sha256 IS NULL AND capability_sha256 IS NULL""",
+            (worker_started_at, lane_id, session_sha256, capability_sha256,
+             execution_id, str(job_id)),
         )
         if cur.rowcount != 1:
             return None
