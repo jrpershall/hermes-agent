@@ -40,11 +40,12 @@ _MANAGED_EXECUTION_DEFAULT_ENV_NAMES = (
     "HERMES_MANAGED_EXECUTION_CAPABILITY",
 )
 # Every env name that has ever carried a principal in this process (the
-# defaults plus any operator-configured names seen at bind time). Stripped
+# defaults plus any validated operator-configured names seen at declaration or
+# bind time). Stripped
 # from every child env while no binding is active, so a stale inherited copy
 # under such a name can never masquerade as a live principal. (Names declared
-# in a job store but not yet bound in this process are not known here —
-# a startup-window gap for custom names only; the defaults are always in.)
+# by the scheduler before it builds a gate/script environment; the defaults
+# are always present from import time.)
 # Immutable snapshot swapped under a lock: child envs are built from the
 # parallel cron pool while another job may be binding a new name, and
 # iterating a mutating set raises mid-spawn.
@@ -54,7 +55,8 @@ _MANAGED_EXECUTION_KNOWN_ENV_NAMES: frozenset[str] = frozenset(
 _MANAGED_EXECUTION_NAMES_LOCK = threading.Lock()
 
 
-def _register_managed_env_names(names: "Iterable[str]") -> None:
+def register_managed_execution_env_names(names: "Iterable[str]") -> None:
+    """Register validated declaration names for inherited-value scrubbing."""
     global _MANAGED_EXECUTION_KNOWN_ENV_NAMES
     new = frozenset(names) - _MANAGED_EXECUTION_KNOWN_ENV_NAMES
     if not new:
@@ -70,7 +72,7 @@ def bind_managed_execution_env(
     items = tuple((str(name), str(value)) for name, value in dict(bindings).items())
     if not items or any(not name or not value for name, value in items):
         raise ValueError("managed execution env bindings must be non-empty name/value pairs")
-    _register_managed_env_names(name for name, _value in items)
+    register_managed_execution_env_names(name for name, _value in items)
     return _MANAGED_EXECUTION_ENV.set(items)
 
 

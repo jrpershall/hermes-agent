@@ -279,6 +279,110 @@ def bind_managed_worker(
     return record
 
 
+def prepare_managed_worker(
+    execution_id: str,
+    *,
+    job_id: str,
+    lane_id: str,
+    session_sha256: str,
+    capability_sha256: str,
+) -> Optional[Dict[str, Any]]:
+    """Reserve a running row without claiming the script worker started."""
+    if not isinstance(lane_id, str) or not lane_id or len(lane_id) > _MAX_LANE_ID_LENGTH:
+        raise ValueError("managed execution lane_id is invalid")
+    for label, digest in (
+        ("session_sha256", session_sha256),
+        ("capability_sha256", capability_sha256),
+    ):
+        if not isinstance(digest, str) or not _SHA256_HEX_RE.match(digest):
+            raise ValueError(f"managed execution {label} must be a lowercase SHA-256 hex digest")
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions
+               SET lane_id=?, session_sha256=?, capability_sha256=?
+               WHERE id=? AND job_id=? AND status='running'
+                 AND worker_started_at IS NULL AND lane_id IS NULL
+                 AND session_sha256 IS NULL AND capability_sha256 IS NULL""",
+            (lane_id, session_sha256, capability_sha256, execution_id, str(job_id)),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
+    _emit_execution_state(record)
+    return record
+
+
+def acknowledge_managed_worker_started(
+    execution_id: str,
+    *,
+    job_id: str,
+    lane_id: str,
+    session_sha256: str,
+    capability_sha256: str,
+) -> Optional[Dict[str, Any]]:
+    """Promote an exact prepared script-worker reservation to started."""
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        current = conn.execute(
+            "SELECT started_at FROM executions WHERE id=? AND job_id=? AND status='running'",
+            (execution_id, str(job_id)),
+        ).fetchone()
+        if current is None:
+            return None
+        started_at = current["started_at"]
+        worker_started_at = max(now, started_at) if isinstance(started_at, str) else now
+        cur = conn.execute(
+            """UPDATE executions SET worker_started_at=?
+               WHERE id=? AND job_id=? AND status='running'
+                 AND worker_started_at IS NULL AND lane_id=?
+                 AND session_sha256=? AND capability_sha256=?""",
+            (
+                worker_started_at,
+                execution_id,
+                str(job_id),
+                lane_id,
+                session_sha256,
+                capability_sha256,
+            ),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
+    _emit_execution_state(record)
+    return record
+
+
+def clear_managed_worker_preparation(
+    execution_id: str,
+    *,
+    job_id: str,
+    lane_id: str,
+    session_sha256: str,
+    capability_sha256: str,
+) -> bool:
+    """Clear one exact unacknowledged reservation after bootstrap failure."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions
+               SET lane_id=NULL, session_sha256=NULL, capability_sha256=NULL
+               WHERE id=? AND job_id=? AND status='running'
+                 AND worker_started_at IS NULL AND lane_id=?
+                 AND session_sha256=? AND capability_sha256=?""",
+            (
+                execution_id,
+                str(job_id),
+                lane_id,
+                session_sha256,
+                capability_sha256,
+            ),
+        )
+        return cur.rowcount == 1
+
+
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,

@@ -305,18 +305,68 @@ def test_script_only_skip_creates_no_worker_principal(
     }
 
 
+def test_first_run_custom_names_are_scrubbed_before_wake_gate(home: Path) -> None:
+    """A fresh scheduler must register declaration names before its first spawn."""
+    custom_id = "FIRST_RUN_FIXER_EXECUTION_ID"
+    custom_cap = "FIRST_RUN_FIXER_EXECUTION_CAPABILITY"
+    probe = home / "first-run-gate-env.json"
+    script = home / "scripts" / "first_run_gate.py"
+    script.write_text(
+        "import json, os\n"
+        f"open({str(probe)!r}, 'w').write(json.dumps({{k: os.environ.get(k) for k in "
+        f"({custom_id!r}, {custom_cap!r})}}))\n"
+        "print(json.dumps({'wakeAgent': False}))\n",
+        encoding="utf-8",
+    )
+    job = _managed_job(
+        script.name,
+        managed_execution_context={
+            "lane_id": "repair-3",
+            "execution_id_env": custom_id,
+            "execution_capability_env": custom_cap,
+        },
+    )
+    repo = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env.update(
+        {
+            "HERMES_HOME": str(home),
+            "PYTHONPATH": str(repo),
+            custom_id: "stale-first-run-id",
+            custom_cap: "stale-first-run-capability",
+        }
+    )
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json, sys; from cron.scheduler import run_job; "
+            "print(json.dumps(run_job(json.loads(sys.argv[1]))))",
+            json.dumps(job),
+        ],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert json.loads(child.stdout.strip().splitlines()[-1])[0] is True
+    assert json.loads(probe.read_text()) == {custom_id: None, custom_cap: None}
+
+
 def test_managed_no_agent_script_is_bound_as_the_worker(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     job = _managed_job(_write_no_agent_worker(home), no_agent=True)
-    real_bind = scheduler.bind_managed_worker
+    real_bind = scheduler.acknowledge_managed_worker_started
     bind_calls: list[str] = []
 
     def _counting_bind(execution_id, **kwargs):
         bind_calls.append(execution_id)
         return real_bind(execution_id, **kwargs)
 
-    monkeypatch.setattr(scheduler, "bind_managed_worker", _counting_bind)
+    monkeypatch.setattr(scheduler, "acknowledge_managed_worker_started", _counting_bind)
 
     assert scheduler.run_one_job(job) is True
 
@@ -378,7 +428,7 @@ def test_managed_no_agent_binding_refusal_never_starts_script(
         return None
 
     monkeypatch.setattr(scheduler.subprocess, "Popen", _tracking_popen)
-    monkeypatch.setattr(scheduler, "bind_managed_worker", _refuse_bind)
+    monkeypatch.setattr(scheduler, "prepare_managed_worker", _refuse_bind)
 
     assert scheduler.run_one_job(job) is True
 
@@ -393,7 +443,45 @@ def test_managed_no_agent_binding_refusal_never_starts_script(
     assert row["status"] == "failed"
     assert row["worker_started_at"] is None
     assert row["capability_sha256"] is None
-    assert "could not be durably bound" in (row["error"] or "")
+    assert "could not be durably prepared" in (row["error"] or "")
+
+
+def test_managed_no_agent_premature_bootstrap_exit_leaves_no_worker_evidence(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BrokenPipe after durable preparation must not claim the script started."""
+    job = _managed_job(_write_no_agent_worker(home), no_agent=True)
+    real_popen = scheduler.subprocess.Popen
+    real_prepare = scheduler.prepare_managed_worker
+    spawned: list[subprocess.Popen] = []
+
+    def _exiting_bootstrap(_argv):
+        return [sys.executable, "-c", "pass"], {}
+
+    def _tracking_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    def _prepare_after_bootstrap_exit(execution_id, **kwargs):
+        spawned[0].wait(timeout=5)
+        return real_prepare(execution_id, **kwargs)
+
+    monkeypatch.setattr(scheduler, "_managed_script_bootstrap_argv", _exiting_bootstrap)
+    monkeypatch.setattr(scheduler.subprocess, "Popen", _tracking_popen)
+    monkeypatch.setattr(
+        scheduler, "prepare_managed_worker", _prepare_after_bootstrap_exit
+    )
+
+    assert scheduler.run_one_job(job) is True
+
+    assert len(spawned) == 1
+    assert spawned[0].poll() is not None
+    assert not (home / "no-agent-worker-env.json").exists()
+    (row,) = executions.list_executions(job_id=job["id"])
+    assert row["status"] == "failed"
+    assert all(row[field] is None for field in executions.MANAGED_EXECUTION_COLUMNS)
+    assert "bootstrap release failed" in (row["error"] or "").lower()
 
 
 def test_managed_no_agent_popen_failure_creates_no_worker_evidence(
