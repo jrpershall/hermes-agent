@@ -5204,15 +5204,85 @@ def run_job(
             )
             _job_workdir = None
 
+        # For a no_agent job the script is not a preflight gate: it is the
+        # worker itself. A managed no_agent worker therefore needs the same
+        # scheduler-owned principal before its process starts. Agent-backed
+        # jobs remain different: their script runs above the managed bind as a
+        # wake gate and never sees the principal.
+        if _managed_context is not None:
+            _managed_execution_id = job.get("execution_id")
+            if not isinstance(_managed_execution_id, str) or not _managed_execution_id:
+                return _refuse_managed_dispatch(
+                    job_id,
+                    job_name,
+                    "managed execution requires a scheduler-created execution row; "
+                    "refusing to dispatch the script worker without one",
+                )
+            _managed_capability = secrets.token_urlsafe(48)
+            _no_agent_session_id = (
+                f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+            )
+            _managed_session_sha256 = hashlib.sha256(
+                f"{_managed_execution_id}:{_no_agent_session_id}".encode("utf-8")
+            ).hexdigest()
+            try:
+                _managed_bound = bind_managed_worker(
+                    _managed_execution_id,
+                    job_id=job_id,
+                    lane_id=_managed_context["lane_id"],
+                    session_sha256=_managed_session_sha256,
+                    capability_sha256=capability_digest(_managed_capability),
+                )
+            except Exception as exc:
+                logger.error(
+                    "Job '%s': managed no_agent binding write failed (%s)",
+                    job_id,
+                    type(exc).__name__,
+                    exc_info=True,
+                )
+                _managed_bound = None
+            if _managed_bound is None:
+                return _refuse_managed_dispatch(
+                    job_id,
+                    job_name,
+                    f"managed execution {_managed_execution_id} could not be durably "
+                    f"bound to lane {_managed_context['lane_id']!r} (row missing, not "
+                    "running, already bound, or ledger write failed); script worker NOT run",
+                )
+            from tools.environments.local import bind_managed_execution_env
+
+            _managed_env_token = bind_managed_execution_env(
+                {
+                    _managed_context["execution_id_env"]: _managed_execution_id,
+                    _managed_context["execution_capability_env"]: _managed_capability,
+                }
+            )
+            del _managed_capability
+            logger.info(
+                "Job '%s': managed no_agent worker bound to execution %s on lane %s",
+                job_id,
+                _managed_execution_id,
+                _managed_context["lane_id"],
+            )
+
         try:
-            ok, output = _run_job_script_with_claim_heartbeat(
-                job, script_path, workdir=_job_workdir, cancel_event=cancel_event,
-            )
-        except Exception as exc:
-            logger.exception(
-                "Job '%s': script execution raised unexpectedly", job_id,
-            )
-            ok, output = False, f"Script execution failed: {exc}"
+            try:
+                ok, output = _run_job_script_with_claim_heartbeat(
+                    job, script_path, workdir=_job_workdir, cancel_event=cancel_event,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Job '%s': script execution raised unexpectedly", job_id,
+                )
+                ok, output = False, f"Script execution failed: {exc}"
+        finally:
+            # The principal belongs only to the script worker. Delivery and
+            # no_agent result formatting happen after it has been removed.
+            if _managed_env_token is not None:
+                from tools.environments.local import reset_managed_execution_env
+
+                reset_managed_execution_env(_managed_env_token)
+                _managed_env_token = None
 
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 

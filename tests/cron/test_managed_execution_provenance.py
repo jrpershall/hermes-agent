@@ -89,6 +89,20 @@ def _write_gate(home: Path, wake: bool) -> str:
     return "gate.py"
 
 
+def _write_no_agent_worker(home: Path) -> str:
+    """Script-only worker that records, but never prints, its principal."""
+    probe = home / "no-agent-worker-env.json"
+    script = home / "scripts" / "no_agent_worker.py"
+    script.write_text(
+        "import json, os\n"
+        f"open({str(probe)!r}, 'w').write(json.dumps({{k: os.environ.get(k) for k in "
+        f"({ID_ENV!r}, {CAP_ENV!r})}}))\n"
+        "print('worker completed')\n",
+        encoding="utf-8",
+    )
+    return "no_agent_worker.py"
+
+
 class _RunJobStubs:
     """Patch run_job's provider/config seams so it runs without credentials.
 
@@ -279,6 +293,49 @@ def test_script_only_skip_creates_no_worker_principal(
         ID_ENV: None,
         CAP_ENV: None,
     }
+
+
+def test_managed_no_agent_script_is_bound_as_the_worker(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _managed_job(_write_no_agent_worker(home), no_agent=True)
+
+    assert scheduler.run_one_job(job) is True
+
+    rows = executions.list_executions(job_id="managed-job")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["status"] == "completed"
+    assert row["lane_id"] == "repair-3"
+    assert row["worker_started_at"]
+    assert SHA256_RE.match(row["session_sha256"])
+    assert SHA256_RE.match(row["capability_sha256"])
+
+    observed = json.loads((home / "no-agent-worker-env.json").read_text())
+    assert observed[ID_ENV] == row["id"]
+    assert observed[CAP_ENV]
+    assert row["capability_sha256"] == hashlib.sha256(
+        observed[CAP_ENV].encode()
+    ).hexdigest()
+    assert observed[CAP_ENV] not in json.dumps(row)
+    assert ID_ENV not in local.build_subprocess_env({})
+    assert CAP_ENV not in local.hermes_subprocess_env()
+
+
+def test_managed_no_agent_binding_refusal_never_starts_script(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _managed_job(_write_no_agent_worker(home), no_agent=True)
+    monkeypatch.setattr(scheduler, "bind_managed_worker", lambda *a, **k: None)
+
+    assert scheduler.run_one_job(job) is True
+
+    assert not (home / "no-agent-worker-env.json").exists()
+    row = executions.list_executions(job_id="managed-job")[0]
+    assert row["status"] == "failed"
+    assert row["worker_started_at"] is None
+    assert row["capability_sha256"] is None
+    assert "could not be durably bound" in (row["error"] or "")
 
 
 # ---------------------------------------------------------------------------
