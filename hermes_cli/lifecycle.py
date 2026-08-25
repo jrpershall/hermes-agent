@@ -10,6 +10,13 @@ logger = logging.getLogger(__name__)
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Notify first-party observers, then invoke compatibility plugin hooks."""
+    # Lifecycle hooks cross the worker-process trust boundary: built-in
+    # observers and plugins may export their payloads.  A managed worker can
+    # echo its raw claim capability through tool output, so redact every hook
+    # payload centrally before any observer sees it.  Execution IDs remain.
+    from tools.environments.local import redact_managed_execution_payload
+
+    kwargs = redact_managed_execution_payload(kwargs)
     try:
         from hermes_cli.observability import observe_lifecycle
 
@@ -39,6 +46,9 @@ def has_hook(hook_name: str) -> bool:
 
 def finalize_session(**kwargs: Any) -> List[Any]:
     """Notify observers and hard-close one core-owned Relay conversation."""
+    from tools.environments.local import redact_managed_execution_payload
+
+    kwargs = redact_managed_execution_payload(kwargs)
     try:
         from hermes_cli.observability import observe_lifecycle
 

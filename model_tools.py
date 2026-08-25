@@ -1169,11 +1169,13 @@ def _emit_post_tool_call_hook(
                 function_name,
                 result,
             )
+        from tools.environments.local import redact_managed_execution_payload
+
         invoke_hook(
             "post_tool_call",
             tool_name=function_name,
-            args=function_args,
-            result=result,
+            args=redact_managed_execution_payload(function_args),
+            result=redact_managed_execution_payload(result),
             task_id=task_id or "",
             session_id=session_id or "",
             tool_call_id=tool_call_id or "",
@@ -1182,8 +1184,10 @@ def _emit_post_tool_call_hook(
             duration_ms=duration_ms,
             status=status,
             error_type=error_type,
-            error_message=error_message,
-            middleware_trace=list(middleware_trace or []),
+            error_message=redact_managed_execution_payload(error_message),
+            middleware_trace=redact_managed_execution_payload(
+                list(middleware_trace or [])
+            ),
         )
     except Exception as _hook_err:
         logger.debug("post_tool_call hook error: %s", _hook_err)

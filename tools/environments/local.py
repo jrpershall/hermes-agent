@@ -11,8 +11,11 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
+import threading
+from collections.abc import Iterable, Mapping
+from contextvars import ContextVar, Token
 from pathlib import Path
+from typing import Any
 
 from hermes_constants import get_process_hermes_home
 from tools.environments.base import BaseEnvironment, _pipe_stdin
@@ -21,6 +24,147 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 _IS_WINDOWS = platform.system() == "Windows"
 
 logger = logging.getLogger(__name__)
+
+# Scheduler-owned managed-execution principal (cron ``managed_execution_context``).
+# The cron scheduler binds ``{env_name: value}`` pairs — the execution ID and
+# the RAW per-execution capability under the job's configured names — to the
+# worker's context right before model dispatch, and every child-process env
+# built in that context carries them. A ContextVar (not ``os.environ``) so
+# parallel cron jobs never see each other's capability and nothing survives
+# the run. Delegated child contexts are scrubbed: the principal belongs to the
+# top-level worker only.
+_MANAGED_EXECUTION_ENV: ContextVar[tuple[tuple[str, str], ...] | None] = ContextVar(
+    "hermes_managed_execution_env", default=None
+)
+_MANAGED_EXECUTION_CAPABILITY_ENV_NAME: ContextVar[str | None] = ContextVar(
+    "hermes_managed_execution_capability_env_name", default=None
+)
+_MANAGED_EXECUTION_DEFAULT_ENV_NAMES = (
+    "HERMES_MANAGED_EXECUTION_ID",
+    "HERMES_MANAGED_EXECUTION_CAPABILITY",
+)
+# Every env name declared for a principal in this process (the defaults plus
+# validated operator-configured names registered at job creation or startup).
+# Stripped from every child env while no binding is active, so a stale inherited
+# copy under such a name can never masquerade as a live principal.
+# Immutable snapshot swapped under a lock: child envs are built from the
+# parallel cron pool while another job may be binding a new name, and
+# iterating a mutating set raises mid-spawn.
+_MANAGED_EXECUTION_KNOWN_ENV_NAMES: frozenset[str] = frozenset(
+    _MANAGED_EXECUTION_DEFAULT_ENV_NAMES
+)
+_MANAGED_EXECUTION_NAMES_LOCK = threading.Lock()
+
+
+def register_managed_execution_env_names(names: "Iterable[str]") -> None:
+    """Register validated declaration names for stale inherited-value stripping."""
+    global _MANAGED_EXECUTION_KNOWN_ENV_NAMES
+    new = frozenset(names) - _MANAGED_EXECUTION_KNOWN_ENV_NAMES
+    if not new:
+        return
+    with _MANAGED_EXECUTION_NAMES_LOCK:
+        _MANAGED_EXECUTION_KNOWN_ENV_NAMES = _MANAGED_EXECUTION_KNOWN_ENV_NAMES | new
+
+
+def bind_managed_execution_env(
+    bindings: "Mapping[str, str]", *, capability_env_name: str | None = None
+) -> tuple[Token[tuple[tuple[str, str], ...] | None], Token[str | None]]:
+    """Bind managed-execution env pairs to the current context; returns a reset token."""
+    items = tuple((str(name), str(value)) for name, value in dict(bindings).items())
+    if not items or any(not name or not value for name, value in items):
+        raise ValueError("managed execution env bindings must be non-empty name/value pairs")
+    if capability_env_name is not None and capability_env_name not in dict(items):
+        raise ValueError("managed capability env name must identify a bound value")
+    if capability_env_name is None and _MANAGED_EXECUTION_DEFAULT_ENV_NAMES[1] in dict(items):
+        capability_env_name = _MANAGED_EXECUTION_DEFAULT_ENV_NAMES[1]
+    register_managed_execution_env_names(name for name, _value in items)
+    return (
+        _MANAGED_EXECUTION_ENV.set(items),
+        _MANAGED_EXECUTION_CAPABILITY_ENV_NAME.set(capability_env_name),
+    )
+
+
+def reset_managed_execution_env(
+    token: tuple[Token[tuple[tuple[str, str], ...] | None], Token[str | None]],
+) -> None:
+    env_token, capability_name_token = token
+    _MANAGED_EXECUTION_CAPABILITY_ENV_NAME.reset(capability_name_token)
+    _MANAGED_EXECUTION_ENV.reset(env_token)
+
+
+def redact_managed_execution_capability(
+    text: str,
+    *,
+    capability_env_name: str | None = None,
+    extra_values: "Iterable[str]" = (),
+) -> str:
+    """Remove only the managed capability before worker output crosses its boundary."""
+    redacted = str(text)
+    binding = _MANAGED_EXECUTION_ENV.get()
+    capability_env_name = (
+        capability_env_name or _MANAGED_EXECUTION_CAPABILITY_ENV_NAME.get()
+    )
+    values = (
+        [value for name, value in binding if name == capability_env_name]
+        if binding is not None
+        else []
+    )
+    values.extend(str(value) for value in extra_values)
+    # Longest first avoids leaving a longer secret partially exposed when one
+    # configured value happens to contain another.
+    for value in sorted(values, key=len, reverse=True):
+        if value:
+            redacted = redacted.replace(value, "[REDACTED_MANAGED_EXECUTION_PRINCIPAL]")
+    return redacted
+
+
+def redact_managed_execution_payload(value: Any) -> Any:
+    """Recursively remove the live managed capability from outbound data.
+
+    Execution IDs are provenance, not secrets, and deliberately remain
+    visible.  Only the raw per-execution capability is removed.
+    """
+    if isinstance(value, str):
+        return redact_managed_execution_capability(value)
+    if isinstance(value, list):
+        return [redact_managed_execution_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_managed_execution_payload(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: redact_managed_execution_payload(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _inject_managed_execution_env(env: dict[str, str]) -> None:
+    """Apply the bound principal to a child env; strip any inherited copy first."""
+    binding = _MANAGED_EXECUTION_ENV.get()
+    for name in _MANAGED_EXECUTION_KNOWN_ENV_NAMES:
+        env.pop(name, None)
+    if binding is None:
+        return
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        delegated = is_delegated_child_process_context()
+    except Exception:
+        # Cannot prove this is the top-level worker: withhold the principal —
+        # loudly, so the downstream "evidence is missing" is traceable here.
+        logger.warning(
+            "managed execution principal withheld from child env: "
+            "delegation context could not be resolved",
+            exc_info=True,
+        )
+        return
+    if delegated:
+        logger.debug(
+            "managed execution principal withheld from delegated child env"
+        )
+        return
+    for name, value in binding:
+        env[name] = value
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -534,6 +678,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     _apply_windows_msys_bash_env_defaults(sanitized)
 
     sanitized = _scrub_delegated_child_kanban_env(sanitized)
+    _inject_managed_execution_env(sanitized)
 
     return sanitized
 
@@ -675,6 +820,10 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # context that later imports Kanban DB code in the spawned process would
     # still see the parent's HERMES_HOME but lose the DB mutation guard.
     env = _scrub_delegated_child_kanban_env(env)
+
+    # Model-driving CLI executors (ACP / codex app-server / claude) ARE the
+    # worker process for a managed cron job — the principal must reach them.
+    _inject_managed_execution_env(env)
 
     return env
 
@@ -1346,6 +1495,7 @@ def _make_run_env(env: dict) -> dict:
     _apply_windows_msys_bash_env_defaults(run_env)
 
     run_env = _scrub_delegated_child_kanban_env(run_env)
+    _inject_managed_execution_env(run_env)
 
     return run_env
 

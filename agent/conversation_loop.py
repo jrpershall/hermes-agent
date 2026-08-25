@@ -3002,6 +3002,13 @@ def run_conversation(
                     _xh["x-initiator"] = "user"
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
+
+                # Request middleware is plugin-owned and may export or retain
+                # both the effective and original request. Remove the raw
+                # managed capability before that first external boundary; the
+                # post-middleware pass below also strips anything echoed or
+                # reintroduced before provider and hook dispatch.
+                api_kwargs = agent._redact_managed_execution_content(api_kwargs)
                 try:
                     from hermes_cli.middleware import apply_llm_request_middleware
 
@@ -3024,6 +3031,18 @@ def run_conversation(
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
+
+                # Tool output is model-controlled and can echo the raw managed
+                # capability inherited by the top-level worker.  Strip that
+                # capability from every provider and observer payload before
+                # either boundary sees it.  Execution IDs remain intact.
+                api_kwargs = agent._redact_managed_execution_content(api_kwargs)
+                _original_api_kwargs = agent._redact_managed_execution_content(
+                    _original_api_kwargs
+                )
+                _llm_middleware_trace = agent._redact_managed_execution_content(
+                    _llm_middleware_trace
+                )
 
                 try:
                     from hermes_cli.lifecycle import (
@@ -3066,8 +3085,12 @@ def run_conversation(
                             turn_id=turn_id,
                             api_request_id=api_request_id,
                             session_id=agent.session_id or "",
-                            user_message=original_user_message,
-                            conversation_history=list(messages),
+                            user_message=agent._redact_managed_execution_content(
+                                original_user_message
+                            ),
+                            conversation_history=agent._redact_managed_execution_content(
+                                list(messages)
+                            ),
                             platform=agent.platform or "",
                             model=agent.model,
                             provider=agent.provider,
@@ -3085,7 +3108,9 @@ def run_conversation(
                             request_char_count=total_chars,
                             max_tokens=agent.max_tokens,
                             started_at=api_start_time,
-                            middleware_trace=list(_llm_middleware_trace),
+                            middleware_trace=agent._redact_managed_execution_content(
+                                list(_llm_middleware_trace)
+                            ),
                             request=_request_payload,
                         )
                 except Exception:
