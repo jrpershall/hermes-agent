@@ -4100,6 +4100,7 @@ def _run_job_script(
     managed_worker_abort: Optional[Callable[[], None]] = None,
     managed_worker_release_abort: Optional[Callable[[], None]] = None,
     managed_capability_env_name: Optional[str] = None,
+    managed_gate_execution: Optional[tuple[str, str, str]] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4190,6 +4191,15 @@ def _run_job_script(
             }
         env = build_subprocess_env()
         env.update(env_overlay)
+        if managed_worker_bind is not None and managed_gate_execution is not None:
+            return False, "Managed script cannot be both a gate and the worker"
+        if managed_gate_execution is not None:
+            execution_id_env, capability_env, execution_id = managed_gate_execution
+            # Agent-path gates may reserve controller work against the running
+            # scheduler row before deciding whether to wake the model. The ID is
+            # non-secret; the raw capability is minted only after wakeAgent=true.
+            env.pop(capability_env, None)
+            env[execution_id_env] = execution_id
         if managed_worker_bind is not None:
             argv, bootstrap_overlay = _managed_script_bootstrap_argv(argv)
             env.update(bootstrap_overlay)
@@ -4407,6 +4417,7 @@ def _run_job_script_with_claim_heartbeat(
     managed_worker_abort: Optional[Callable[[], None]] = None,
     managed_worker_release_abort: Optional[Callable[[], None]] = None,
     managed_capability_env_name: Optional[str] = None,
+    managed_gate_execution: Optional[tuple[str, str, str]] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -4437,6 +4448,7 @@ def _run_job_script_with_claim_heartbeat(
             managed_worker_abort=managed_worker_abort,
             managed_worker_release_abort=managed_worker_release_abort,
             managed_capability_env_name=managed_capability_env_name,
+            managed_gate_execution=managed_gate_execution,
         )
 
     job_id = str(job.get("id") or "")
@@ -4477,6 +4489,7 @@ def _run_job_script_with_claim_heartbeat(
             managed_worker_abort=managed_worker_abort,
             managed_worker_release_abort=managed_worker_release_abort,
             managed_capability_env_name=managed_capability_env_name,
+            managed_gate_execution=managed_gate_execution,
         )
 
     try:
@@ -4489,6 +4502,7 @@ def _run_job_script_with_claim_heartbeat(
             managed_worker_abort=managed_worker_abort,
             managed_worker_release_abort=managed_worker_release_abort,
             managed_capability_env_name=managed_capability_env_name,
+            managed_gate_execution=managed_gate_execution,
         )
     finally:
         stop.set()
@@ -5936,9 +5950,27 @@ def run_job(
     # the script is only executed once.
     prerun_script = None
     script_path = job.get("script")
+    _managed_gate_execution = None
+    if script_path and _managed_context is not None:
+        _managed_gate_execution_id = job.get("execution_id")
+        if not isinstance(_managed_gate_execution_id, str) or not _managed_gate_execution_id:
+            return _refuse_managed_dispatch(
+                job_id,
+                job_name,
+                "managed execution requires a scheduler-created execution row; "
+                "refusing to run the script gate without one",
+            )
+        _managed_gate_execution = (
+            _managed_context["execution_id_env"],
+            _managed_context["execution_capability_env"],
+            _managed_gate_execution_id,
+        )
     if script_path:
         prerun_script = _run_job_script_with_claim_heartbeat(
-            job, script_path, cancel_event=cancel_event,
+            job,
+            script_path,
+            cancel_event=cancel_event,
+            managed_gate_execution=_managed_gate_execution,
         )
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):

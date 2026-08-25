@@ -9,8 +9,10 @@ Contract under test (declared by a job's ``managed_execution_context``):
   through the configured environment variable names.
 * Only digests ever enter SQLite; the raw capability never appears in the
   ledger, the job output, logs, or error text.
-* A script gate that returns ``wakeAgent=false`` produces NO worker evidence
-  and no provider call, and the gate script itself never sees the binding.
+* An agent-path script gate receives only the non-secret scheduler execution ID
+  so it can reserve controller work before deciding whether to wake the model;
+  the raw capability is minted only after ``wakeAgent=true`` and never reaches
+  the gate. A gate that returns ``wakeAgent=false`` produces no worker evidence.
 * Malformed declarations and ledger write failures stop BEFORE dispatch.
 * Terminalization and interrupted-execution recovery preserve the binding.
 * Jobs that do not declare a managed context keep today's ledger shape.
@@ -90,6 +92,40 @@ def _write_gate(home: Path, wake: bool) -> str:
         encoding="utf-8",
     )
     return "gate.py"
+
+
+def _write_critic_claim_gate(home: Path) -> str:
+    """Agent-path gate that claims a critic route from the running execution."""
+    probe = home / "critic-claim.json"
+    script = home / "scripts" / "critic_claim_gate.py"
+    script.write_text(
+        "import json, os, sqlite3, sys\n"
+        f"execution_id = os.environ.get({ID_ENV!r})\n"
+        f"capability = os.environ.get({CAP_ENV!r})\n"
+        "if not execution_id:\n"
+        "    print('critic execution id is invalid', file=sys.stderr)\n"
+        "    raise SystemExit(17)\n"
+        "if capability is not None:\n"
+        "    print('gate received managed capability', file=sys.stderr)\n"
+        "    raise SystemExit(18)\n"
+        f"db = sqlite3.connect({str(home / 'cron' / 'executions.db')!r})\n"
+        "db.row_factory = sqlite3.Row\n"
+        "row = db.execute('SELECT * FROM executions WHERE id=?', (execution_id,)).fetchone()\n"
+        "db.close()\n"
+        "if row is None or row['status'] != 'running':\n"
+        "    print('critic execution id is invalid', file=sys.stderr)\n"
+        "    raise SystemExit(19)\n"
+        f"open({str(probe)!r}, 'w').write(json.dumps({{\n"
+        "    'execution_id': execution_id,\n"
+        "    'status': row['status'],\n"
+        "    'lane_id': row['lane_id'],\n"
+        "    'worker_started_at': row['worker_started_at'],\n"
+        "    'capability_seen': capability is not None,\n"
+        "}))\n"
+        "print(json.dumps({'wakeAgent': True, 'criticClaimed': True}))\n",
+        encoding="utf-8",
+    )
+    return script.name
 
 
 def _write_no_agent_worker(home: Path) -> str:
@@ -279,6 +315,7 @@ def test_managed_wake_agent_execution_gets_one_durable_principal(
 
     # The raw capability never leaves the worker context.
     persisted = executions.latest_execution("managed-job")
+    assert persisted is not None
     assert persisted["status"] == "completed"
     assert persisted["lane_id"] == "repair-3"
     assert persisted["worker_started_at"] == bound["worker_started_at"]
@@ -290,9 +327,9 @@ def test_managed_wake_agent_execution_gets_one_durable_principal(
     assert capability not in caplog.text
     assert not any(capability in str(r) for r in observed.get("runs", []))
 
-    # The gate script ran before binding and saw nothing.
+    # The gate script ran before worker binding with only the non-secret ID.
     assert json.loads((home / "gate-env.json").read_text()) == {
-        ID_ENV: None,
+        ID_ENV: persisted["id"],
         CAP_ENV: None,
     }
 
@@ -300,6 +337,32 @@ def test_managed_wake_agent_execution_gets_one_durable_principal(
     assert ID_ENV not in local.build_subprocess_env({})
     assert CAP_ENV not in local.hermes_subprocess_env()
     assert ID_ENV not in os.environ and CAP_ENV not in os.environ
+
+
+def test_managed_agent_gate_can_claim_critic_route_with_execution_id_only(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate resolves its running row before the agent principal is minted."""
+    stubs = _RunJobStubs(monkeypatch, tmp_path)
+    job = _managed_job(_write_critic_claim_gate(home))
+
+    assert scheduler.run_one_job(job) is True
+
+    claim = json.loads((home / "critic-claim.json").read_text(encoding="utf-8"))
+    row = executions.latest_execution(job["id"])
+    assert row is not None
+    assert claim == {
+        "execution_id": row["id"],
+        "status": "running",
+        "lane_id": None,
+        "worker_started_at": None,
+        "capability_seen": False,
+    }
+    assert stubs.observed.get("constructed") is True
+    assert row["status"] == "completed"
+    assert row["lane_id"] == CONTEXT["lane_id"]
+    assert row["worker_started_at"]
+    assert SHA256_RE.match(row["capability_sha256"])
 
 
 def test_managed_agent_output_cannot_persist_or_deliver_raw_capability(
@@ -433,7 +496,7 @@ def test_script_only_skip_creates_no_worker_principal(
     assert row["session_sha256"] is None
     assert row["capability_sha256"] is None
     assert json.loads((home / "gate-env.json").read_text()) == {
-        ID_ENV: None,
+        ID_ENV: row["id"],
         CAP_ENV: None,
     }
 
@@ -459,6 +522,9 @@ def test_first_run_custom_names_are_scrubbed_before_wake_gate(home: Path) -> Non
             "execution_capability_env": custom_cap,
         },
     )
+    execution = executions.create_execution(job["id"], source="builtin")
+    assert executions.mark_execution_running(execution["id"])
+    job["execution_id"] = execution["id"]
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env.update(
@@ -485,7 +551,10 @@ def test_first_run_custom_names_are_scrubbed_before_wake_gate(home: Path) -> Non
     )
 
     assert json.loads(child.stdout.strip().splitlines()[-1])[0] is True
-    assert json.loads(probe.read_text()) == {custom_id: None, custom_cap: None}
+    assert json.loads(probe.read_text()) == {
+        custom_id: execution["id"],
+        custom_cap: None,
+    }
 
 
 def test_managed_no_agent_script_is_bound_as_the_worker(
